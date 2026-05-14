@@ -10,6 +10,3 @@
 [submodule "lib/justanaccount"]
 	path = lib/justanaccount
 	url = https://github.com/JustaName-id/justanaccount
-[submodule "lib/solidity-lib"]
-	path = lib/solidity-lib
-	url = https://github.com/dl-solarity/solidity-lib

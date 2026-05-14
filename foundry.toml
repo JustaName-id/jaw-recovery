@@ -10,8 +10,7 @@ remappings = [
     "solady/=lib/solady/src/",
     "justanaccount/=lib/justanaccount/src/",
     "safe-singleton-deployer-sol/=lib/justanaccount/lib/safe-singleton-deployer-sol/",
-    "@account-abstraction/=lib/justanaccount/lib/account-abstraction/contracts/",
-    "@solarity/=lib/solidity-lib/contracts/"
+    "@account-abstraction/=lib/justanaccount/lib/account-abstraction/contracts/"
 ]
 
 optimizer = true
