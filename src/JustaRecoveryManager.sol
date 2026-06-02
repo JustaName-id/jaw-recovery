@@ -15,8 +15,8 @@ import { IRecoveryManager } from "./interfaces/IRecoveryManager.sol";
  *
  * @notice Recovery coordinator for JustanAccount. Registered as an owner of each opted-in account,
  * it holds the per-account registry of recovery providers and orchestrates a two-step time-locked
- * recovery flow that, on a successful proof and after a configurable delay, registers a new
- * WebAuthn public-key owner on the target account.
+ * recovery flow that, once the account's threshold of providers approve and after a configurable
+ * delay, registers a new owner (WebAuthn passkey or EOA) on the target account.
  *
  * @dev The manager performs no cryptographic verification of its own. It dispatches to the provider
  *      the account opted into and trusts the provider's return value; provider trust is therefore
@@ -40,7 +40,6 @@ contract JustaRecoveryManager is IRecoveryManager, ReentrancyGuard {
      */
     struct PendingRecovery {
         address account;
-        address provider;
         uint64 executeAt;
         bytes subject;
     }
@@ -50,9 +49,9 @@ contract JustaRecoveryManager is IRecoveryManager, ReentrancyGuard {
     ////////////////////////////////////////////////////////////////////////
 
     /**
-     * @notice The minimum allowed value for the per-account recovery delay.
+     * @notice The default per-account recovery delay, applied until an account overrides it.
      */
-    uint256 public constant MIN_RECOVERY_DELAY = 24 hours;
+    uint256 public constant DEFAULT_RECOVERY_DELAY = 24 hours;
 
     /**
      * @notice The maximum allowed value for the per-account recovery delay.
@@ -69,10 +68,16 @@ contract JustaRecoveryManager is IRecoveryManager, ReentrancyGuard {
     mapping(address account => EnumerableSet.AddressSet providers) internal _providers;
 
     /**
-     * @notice Per-account recovery delay in seconds. `0` means "never set" — recovery is disabled
-     *         for the account until `setRecoveryDelay` is called.
+     * @notice Per-account recovery delay override in seconds. Only meaningful when
+     *         `_recoveryDelayConfigured[account]` is true; otherwise `DEFAULT_RECOVERY_DELAY` applies.
      */
     mapping(address account => uint256 delaySeconds) internal _recoveryDelay;
+
+    /**
+     * @notice Whether the account has explicitly set a delay. When false, `DEFAULT_RECOVERY_DELAY`
+     *         applies; when true, the stored `_recoveryDelay` value applies (including 0 = instant).
+     */
+    mapping(address account => bool configured) internal _recoveryDelayConfigured;
 
     /**
      * @notice Per-account monotonic counter used to derive deterministic `recoveryId`s.
@@ -84,6 +89,11 @@ contract JustaRecoveryManager is IRecoveryManager, ReentrancyGuard {
      */
     mapping(bytes32 recoveryId => PendingRecovery) internal _pendingRecoveries;
 
+    /**
+     * @notice Per-account approval threshold. `0` means "use the default of 1".
+     */
+    mapping(address account => uint256 threshold) internal _recoveryThreshold;
+
     ////////////////////////////////////////////////////////////////////////
     // MODIFIERS
     ////////////////////////////////////////////////////////////////////////
@@ -93,6 +103,25 @@ contract JustaRecoveryManager is IRecoveryManager, ReentrancyGuard {
             revert JustaRecoveryManager_NotAccount(msg.sender, account);
         }
         _;
+    }
+
+    ////////////////////////////////////////////////////////////////////////
+    // INTERNAL HELPERS
+    ////////////////////////////////////////////////////////////////////////
+
+    /**
+     * @dev Effective approval threshold for an account (`0` stored => default `1`).
+     */
+    function _effectiveThreshold(address account) internal view returns (uint256) {
+        uint256 threshold = _recoveryThreshold[account];
+        return threshold == 0 ? 1 : threshold;
+    }
+
+    /**
+     * @dev Effective recovery delay: the stored value if the account configured one, else the default.
+     */
+    function _effectiveDelay(address account) internal view returns (uint256) {
+        return _recoveryDelayConfigured[account] ? _recoveryDelay[account] : DEFAULT_RECOVERY_DELAY;
     }
 
     ////////////////////////////////////////////////////////////////////////
@@ -157,6 +186,12 @@ contract JustaRecoveryManager is IRecoveryManager, ReentrancyGuard {
             revert JustaRecoveryManager_ProviderNotRegistered(account, provider);
         }
 
+        // Disallow dropping below the threshold (except a full opt-out to zero providers).
+        uint256 newCount = _providers[account].length();
+        if (newCount != 0 && newCount < _effectiveThreshold(account)) {
+            revert JustaRecoveryManager_RemovalBelowThreshold(newCount, _effectiveThreshold(account));
+        }
+
         // Forward to the provider, attaching any value sent with the call
         IJustaRecoveryProvider(provider).unsubscribe{ value: msg.value }(account);
 
@@ -165,24 +200,41 @@ contract JustaRecoveryManager is IRecoveryManager, ReentrancyGuard {
 
     /**
      * @notice Set the per-account recovery delay.
-     * @dev Callable only by the account itself. Takes effect immediately in both directions; any
-     *      already-queued recovery keeps its original `executeAt`. Reverts if `delaySeconds` is
-     *      outside `[MIN_RECOVERY_DELAY, MAX_RECOVERY_DELAY]`. There is no on-chain default — until
-     *      this is called for an account, `initiateRecovery` will revert with `DelayNotSet`.
+     * @dev Callable only by the account. No minimum — `0` is allowed and means instant. Reverts only
+     *      if above `MAX_RECOVERY_DELAY`. Marks the account as having configured a delay (so the
+     *      default no longer applies). Pending recoveries keep their original `executeAt`.
      * @param account The smart account.
-     * @param delaySeconds The new delay in seconds.
+     * @param delaySeconds The new delay in seconds (`0` = instant).
      */
     function setRecoveryDelay(address account, uint256 delaySeconds) external onlyAccount(account) {
-        // Validate bounds
-        if (delaySeconds < MIN_RECOVERY_DELAY || delaySeconds > MAX_RECOVERY_DELAY) {
-            revert JustaRecoveryManager_DelayOutOfBounds(delaySeconds, MIN_RECOVERY_DELAY, MAX_RECOVERY_DELAY);
+        if (delaySeconds > MAX_RECOVERY_DELAY) {
+            revert JustaRecoveryManager_DelayOutOfBounds(delaySeconds, 0, MAX_RECOVERY_DELAY);
         }
 
-        // Capture previous value for the event, then write
-        uint256 oldDelay = _recoveryDelay[account];
+        uint256 oldDelay = _effectiveDelay(account);
         _recoveryDelay[account] = delaySeconds;
+        _recoveryDelayConfigured[account] = true;
 
         emit RecoveryDelayChanged(account, oldDelay, delaySeconds);
+    }
+
+    /**
+     * @notice Set the per-account approval threshold.
+     * @dev Callable only by the account. Must be within `[1, providerCount]` so a recovery is always
+     *      achievable. With a single provider the only valid value is 1 (the default).
+     * @param account The smart account.
+     * @param threshold The number of distinct providers required to approve a recovery.
+     */
+    function setRecoveryThreshold(address account, uint256 threshold) external onlyAccount(account) {
+        uint256 providerCount = _providers[account].length();
+        if (threshold < 1 || threshold > providerCount) {
+            revert JustaRecoveryManager_InvalidThreshold(threshold, providerCount);
+        }
+
+        uint256 oldThreshold = _effectiveThreshold(account);
+        _recoveryThreshold[account] = threshold;
+
+        emit RecoveryThresholdChanged(account, oldThreshold, threshold);
     }
 
     ////////////////////////////////////////////////////////////////////////
@@ -190,57 +242,72 @@ contract JustaRecoveryManager is IRecoveryManager, ReentrancyGuard {
     ////////////////////////////////////////////////////////////////////////
 
     /**
-     * @notice Queue a recovery for an account.
-     * @dev Unrestricted caller; the proof carries authorization. Verifies the proof via the
-     *      provider (which is expected to enforce its own replay protection), then stores a
-     *      `PendingRecovery` whose `executeAt` is `block.timestamp + recoveryDelay(account)`.
-     *      Reverts with `DelayNotSet` if the account has never configured its delay.
+     * @notice Queue a recovery for an account once enough providers have approved the same new owner.
+     * @dev Unrestricted caller; the proofs carry authorization. Requires exactly
+     *      `recoveryThreshold(account)` distinct, registered providers to each verify a proof over the
+     *      same `subject`. `subject` must be a 32-byte EOA owner or a 64-byte passkey owner.
      * @param account The smart account to recover.
-     * @param subject ABI-encoded WebAuthn public key (bytes32 x, bytes32 y) of the new owner.
-     * @param provider The recovery provider whose proof is being submitted.
-     * @param proof Provider-specific recovery proof.
+     * @param subject ABI-encoded new owner: `abi.encode(address)` (32B) or `abi.encode(bytes32 x, bytes32 y)` (64B).
+     * @param providers The registered providers approving this recovery (length must equal the threshold).
+     * @param proofs Provider-specific proofs, index-aligned with `providers`.
      * @return recoveryId A deterministic id for the queued recovery.
      */
     function initiateRecovery(
         address account,
         bytes calldata subject,
-        address provider,
-        bytes calldata proof
+        address[] calldata providers,
+        bytes[] calldata proofs
     )
         external
         nonReentrant
         returns (bytes32 recoveryId)
     {
-        // Confirm the provider is registered for this account
-        if (!_providers[account].contains(provider)) {
-            revert JustaRecoveryManager_ProviderNotRegistered(account, provider);
+        if (providers.length != proofs.length) {
+            revert JustaRecoveryManager_LengthMismatch(providers.length, proofs.length);
         }
 
-        // Require the account to have explicitly configured a delay
-        uint256 delay = _recoveryDelay[account];
-        if (delay == 0) {
-            revert JustaRecoveryManager_DelayNotSet(account);
+        uint256 required = _effectiveThreshold(account);
+        if (providers.length != required) {
+            revert JustaRecoveryManager_InvalidProofCount(providers.length, required);
         }
 
-        // Delegate proof verification to the provider; provider MUST revert on invalid proof
-        IJustaRecoveryProvider(provider).recover(account, subject, proof);
+        if (subject.length != 32 && subject.length != 64) {
+            revert JustaRecoveryManager_InvalidSubjectLength(subject.length);
+        }
 
-        // Derive a deterministic recoveryId from the per-account nonce
-        recoveryId = keccak256(abi.encode(account, provider, subject, _recoveryNonce[account]++));
+        for (uint256 i = 0; i < providers.length; ++i) {
+            address provider = providers[i];
 
-        // Queue the recovery — executeAt is captured now and never recomputed
-        uint64 executeAt = uint64(block.timestamp + delay);
-        _pendingRecoveries[recoveryId] =
-            PendingRecovery({ account: account, provider: provider, executeAt: executeAt, subject: subject });
+            // Must be a registered provider for this account.
+            if (!_providers[account].contains(provider)) {
+                revert JustaRecoveryManager_ProviderNotRegistered(account, provider);
+            }
 
-        emit RecoveryInitiated(account, recoveryId, provider, subject, executeAt);
+            // Must be distinct from every earlier entry.
+            for (uint256 j = 0; j < i; ++j) {
+                if (providers[j] == provider) {
+                    revert JustaRecoveryManager_DuplicateProvider(provider);
+                }
+            }
+
+            // Delegate proof verification; provider reverts on an invalid proof and bumps its own nonce.
+            IJustaRecoveryProvider(provider).recover(account, subject, proofs[i]);
+        }
+
+        recoveryId = keccak256(abi.encode(account, subject, _recoveryNonce[account]++));
+
+        uint64 executeAt = uint64(block.timestamp + _effectiveDelay(account));
+        _pendingRecoveries[recoveryId] = PendingRecovery({ account: account, executeAt: executeAt, subject: subject });
+
+        emit RecoveryInitiated(account, recoveryId, providers, subject, executeAt);
     }
 
     /**
      * @notice Finalize a queued recovery whose delay has elapsed.
-     * @dev Unrestricted caller. Decodes `subject` and calls `addOwnerPublicKey(x, y)` on the
-     *      account, which requires the manager to be a registered owner of the account (set during
-     *      opt-in). The pending entry is deleted before the external call (CEI).
+     * @dev Unrestricted caller. Registers the new owner from `subject` — a 64-byte passkey via
+     *      `addOwnerPublicKey`, or a 32-byte EOA via `addOwnerAddress`. Requires the manager to be a
+     *      registered owner of the account (set during opt-in). The pending entry is deleted before the
+     *      external call (CEI).
      * @param recoveryId The id returned from `initiateRecovery`.
      */
     function executeRecovery(bytes32 recoveryId) external nonReentrant {
@@ -258,17 +325,24 @@ contract JustaRecoveryManager is IRecoveryManager, ReentrancyGuard {
 
         // Snapshot fields to memory before deletion
         address account = rec.account;
-        address provider = rec.provider;
         bytes memory subject = rec.subject;
 
         // Delete the pending entry first (CEI)
         delete _pendingRecoveries[recoveryId];
 
-        // Decode the new WebAuthn public key from subject and register it as an owner
-        (bytes32 x, bytes32 y) = abi.decode(subject, (bytes32, bytes32));
-        MultiOwnable(account).addOwnerPublicKey(x, y);
+        // Register the new owner. `subject` length selects the owner type (validated at initiate):
+        //   64 bytes => WebAuthn passkey (bytes32 x, bytes32 y); 32 bytes => EOA address.
+        if (subject.length == 64) {
+            (bytes32 x, bytes32 y) = abi.decode(subject, (bytes32, bytes32));
+            MultiOwnable(account).addOwnerPublicKey(x, y);
+        } else if (subject.length == 32) {
+            address owner = abi.decode(subject, (address));
+            MultiOwnable(account).addOwnerAddress(owner);
+        } else {
+            revert JustaRecoveryManager_InvalidSubjectLength(subject.length);
+        }
 
-        emit RecoveryExecuted(account, recoveryId, provider, subject);
+        emit RecoveryExecuted(account, recoveryId, subject);
     }
 
     /**
@@ -321,13 +395,21 @@ contract JustaRecoveryManager is IRecoveryManager, ReentrancyGuard {
     }
 
     /**
-     * @notice Read the account's configured recovery delay in seconds.
-     * @dev Returns `0` if the account has never called `setRecoveryDelay`.
+     * @notice Read the account's effective recovery delay in seconds (the 24h default if never set).
      * @param account The smart account.
-     * @return The configured delay in seconds, or 0 if unset.
+     * @return The effective delay in seconds.
      */
     function recoveryDelay(address account) external view returns (uint256) {
-        return _recoveryDelay[account];
+        return _effectiveDelay(account);
+    }
+
+    /**
+     * @notice Read the account's effective approval threshold (1 if never set).
+     * @param account The smart account.
+     * @return The number of distinct providers required to approve a recovery.
+     */
+    function recoveryThreshold(address account) external view returns (uint256) {
+        return _effectiveThreshold(account);
     }
 
     /**
@@ -335,17 +417,16 @@ contract JustaRecoveryManager is IRecoveryManager, ReentrancyGuard {
      * @dev Returns zero / empty values if `recoveryId` is not currently pending.
      * @param recoveryId The recovery id.
      * @return account The smart account being recovered.
-     * @return provider The provider whose proof initiated this recovery.
      * @return executeAt The timestamp at which the recovery becomes executable.
-     * @return subject The new-owner payload (ABI-encoded WebAuthn key).
+     * @return subject The new-owner payload.
      */
     function pendingRecovery(bytes32 recoveryId)
         external
         view
-        returns (address account, address provider, uint64 executeAt, bytes memory subject)
+        returns (address account, uint64 executeAt, bytes memory subject)
     {
         PendingRecovery storage rec = _pendingRecoveries[recoveryId];
-        return (rec.account, rec.provider, rec.executeAt, rec.subject);
+        return (rec.account, rec.executeAt, rec.subject);
     }
 
 }
