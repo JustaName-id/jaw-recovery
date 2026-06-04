@@ -4,75 +4,38 @@ pragma solidity 0.8.30;
 /**
  * @title IJustaRecoveryProvider
  *
- * @notice JAW-specific recovery provider interface. Differs from EIP-7947's IRecoveryProvider
- * by taking `account` explicitly on every state-changing function — the caller is always the
- * JustaRecoveryManager singleton, never the account itself, so `msg.sender` cannot be used
- * to identify the account.
+ * @notice Stateless verifier interface for JAW recovery providers. A provider holds NO per-account
+ * state: the JustaRecoveryManager owns the registry of recovery commitments and the per-account replay
+ * nonce, and passes both in on every call. A provider's sole job is to answer — for a given commitment —
+ * whether a proof authorizes recovering `account` to the new owner encoded in `subject`.
  *
  * Implementations MUST:
- *   - hard-code the JustaRecoveryManager address as an immutable;
- *   - reject calls from any other address on subscribe / unsubscribe / recover;
- *   - ensure that proofs cannot be replayed (typically via a per-account nonce).
+ *   - revert on an invalid proof, and return (no value) on success;
+ *   - bind the proof to `(account, nonce, subject)` so it cannot be replayed across accounts, nonces, or
+ *     target owners. The manager increments `nonce` after every recovery, which makes a proof single-use.
+ *
+ * Implementations SHOULD be `view` (pure verification) — they are handed all the state they need.
  *
  * @author JustaLab
  */
 interface IJustaRecoveryProvider {
 
-    ////////////////////////////////////////////////////////////////////////
-    // ERRORS
-    ////////////////////////////////////////////////////////////////////////
-
     /**
-     * @notice Thrown when the caller is not the JustaRecoveryManager.
-     * @param caller The actual caller.
-     */
-    error JustaRecoveryProvider_NotManager(address caller);
-
-    ////////////////////////////////////////////////////////////////////////
-    // EVENTS
-    ////////////////////////////////////////////////////////////////////////
-
-    event AccountSubscribed(address indexed account);
-    event AccountUnsubscribed(address indexed account);
-
-    ////////////////////////////////////////////////////////////////////////
-    // EXTERNAL FUNCTIONS
-    ////////////////////////////////////////////////////////////////////////
-
-    /**
-     * @notice Subscribe an account to this provider with the given commitment.
-     * @dev MUST be callable only by the JustaRecoveryManager. Stores the commitment keyed by `account`.
-     * @param account The smart account being subscribed.
-     * @param data Provider-specific commitment payload.
-     */
-    function subscribe(address account, bytes calldata data) external payable;
-
-    /**
-     * @notice Unsubscribe an account from this provider, deleting all stored recovery data.
-     * @dev MUST be callable only by the JustaRecoveryManager.
-     * @param account The smart account being unsubscribed.
-     */
-    function unsubscribe(address account) external payable;
-
-    /**
-     * @notice Verify a recovery proof for an account.
-     * @dev MUST be callable only by the JustaRecoveryManager. Reverts if the proof is invalid.
-     *      MUST update internal replay state (e.g. nonce) on success so the same proof cannot be reused.
+     * @notice Verify that `proof` authorizes recovering `account` to the owner encoded in `subject`,
+     *         against the recovery `commitment`. MUST revert if it does not.
      * @param account The smart account being recovered.
-     * @param subject The recovery subject (opaque to provider; bound by the proof).
+     * @param subject The new-owner payload (opaque to the provider; bound by the proof).
+     * @param nonce The manager's current per-account recovery nonce, bound into the proof for replay safety.
+     * @param commitment The recovery commitment this proof is checked against (e.g. an EOA, an email hash).
      * @param proof Provider-specific proof.
      */
-    function recover(address account, bytes calldata subject, bytes calldata proof) external;
-
-    ////////////////////////////////////////////////////////////////////////
-    // VIEW FUNCTIONS
-    ////////////////////////////////////////////////////////////////////////
-
-    /**
-     * @notice Get the stored recovery commitment for an account.
-     * @param account The smart account.
-     * @return The provider-specific commitment bytes.
-     */
-    function getRecoveryData(address account) external view returns (bytes memory);
+    function verify(
+        address account,
+        bytes calldata subject,
+        uint256 nonce,
+        bytes calldata commitment,
+        bytes calldata proof
+    )
+        external;
 
 }

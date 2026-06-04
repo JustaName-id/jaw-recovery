@@ -12,10 +12,6 @@ import { JustaECDSARecoveryProvider } from "../src/providers/JustaECDSARecoveryP
  */
 contract DeployJustaECDSARecoveryProvider is Script {
 
-    /// @dev The JustaRecoveryManager address. Must match the deterministic deployment of the manager
-    /// on this chain. Fill in once the manager has been first-deployed.
-    address constant JUSTA_RECOVERY_MANAGER = address(0);
-
     /// @dev Set to address(0) until the first deterministic deploy; the assert below is guarded so
     /// the first run succeeds. Update with the real address afterwards to enforce the same address
     /// across every chain.
@@ -25,7 +21,6 @@ contract DeployJustaECDSARecoveryProvider is Script {
 
     function run() public {
         console2.log("Deploying JustaECDSARecoveryProvider on chain ID", block.chainid);
-        require(JUSTA_RECOVERY_MANAGER != address(0), "Set JUSTA_RECOVERY_MANAGER before deploying");
 
         if (block.chainid == 31_337) {
             vm.startBroadcast();
@@ -37,16 +32,14 @@ contract DeployJustaECDSARecoveryProvider is Script {
     }
 
     function deploy() internal {
-        JustaECDSARecoveryProvider provider = new JustaECDSARecoveryProvider{ salt: 0 }(JUSTA_RECOVERY_MANAGER);
+        JustaECDSARecoveryProvider provider = new JustaECDSARecoveryProvider{ salt: 0 }();
 
         logAddress("JustaECDSARecoveryProvider", address(provider));
     }
 
     function deployWithSafeSingleton() internal {
         address provider = SafeSingletonDeployer.broadcastDeploy({
-            creationCode: type(JustaECDSARecoveryProvider).creationCode,
-            args: abi.encode(JUSTA_RECOVERY_MANAGER),
-            salt: PROVIDER_SALT
+            creationCode: type(JustaECDSARecoveryProvider).creationCode, args: "", salt: PROVIDER_SALT
         });
 
         console2.log("Deployed JustaECDSARecoveryProvider:", provider);

@@ -13,22 +13,24 @@ import { IRecoveryManager } from "./interfaces/IRecoveryManager.sol";
 /**
  * @title JustaRecoveryManager
  *
- * @notice Recovery coordinator for JustanAccount. Registered as an owner of each opted-in account,
- * it holds the per-account registry of recovery providers and orchestrates a two-step time-locked
- * recovery flow that, once the account's threshold of providers approve and after a configurable
- * delay, registers a new owner (WebAuthn passkey or EOA) on the target account.
+ * @notice Recovery coordinator for JustanAccount. Registered as an owner of each opted-in account, it
+ * holds the per-account registry of recovery slots and orchestrates a two-step time-locked recovery flow
+ * that, once a threshold of slots approve and after a configurable delay, registers a new owner (WebAuthn
+ * passkey or EOA) on the target account.
  *
- * @dev The manager performs no cryptographic verification of its own. It dispatches to the provider
- *      the account opted into and trusts the provider's return value; provider trust is therefore
- *      equivalent to provider correctness. The delay is enforced purely at the manager level and is
- *      provider-agnostic. Non-ownable, non-upgradeable, deployed once per chain at a deterministic
- *      address.
+ * @dev The unit of recovery is a "slot": a `(provider, commitment)` pair, keyed by
+ *      `keccak256(abi.encode(provider, commitment))`. The same provider may back several slots for one
+ *      account. The manager owns all state — slots & commitments, the approval threshold, the time-lock
+ *      delay, and the per-account replay nonce — and treats providers as stateless verifiers: on each
+ *      slot it calls `provider.verify(account, subject, nonce, commitment, proof)`, which reverts on an
+ *      invalid proof. Provider trust is therefore equivalent to provider correctness. Non-ownable,
+ *      non-upgradeable, deployed once per chain at a deterministic address.
  *
  * @author JustaLab
  */
 contract JustaRecoveryManager is IRecoveryManager, ReentrancyGuard {
 
-    using EnumerableSet for EnumerableSet.AddressSet;
+    using EnumerableSet for EnumerableSet.Bytes32Set;
 
     ////////////////////////////////////////////////////////////////////////
     // STRUCTS
@@ -63,9 +65,14 @@ contract JustaRecoveryManager is IRecoveryManager, ReentrancyGuard {
     ////////////////////////////////////////////////////////////////////////
 
     /**
-     * @notice Per-account set of registered recovery providers.
+     * @notice Per-account set of registered slot ids (`keccak256(abi.encode(provider, commitment))`).
      */
-    mapping(address account => EnumerableSet.AddressSet providers) internal _providers;
+    mapping(address account => EnumerableSet.Bytes32Set slotIds) internal _slotIds;
+
+    /**
+     * @notice Per-account slot data, keyed by slot id.
+     */
+    mapping(address account => mapping(bytes32 slotId => RecoverySlot slot)) internal _slots;
 
     /**
      * @notice Per-account recovery delay override in seconds. Only meaningful when
@@ -80,7 +87,13 @@ contract JustaRecoveryManager is IRecoveryManager, ReentrancyGuard {
     mapping(address account => bool configured) internal _recoveryDelayConfigured;
 
     /**
-     * @notice Per-account monotonic counter used to derive deterministic `recoveryId`s.
+     * @notice Per-account approval threshold. `0` means "use the default of 1".
+     */
+    mapping(address account => uint256 threshold) internal _recoveryThreshold;
+
+    /**
+     * @notice Per-account replay nonce. Bound into every proof and bumped on each successful initiation,
+     *         which makes proofs single-use. Also seeds the deterministic `recoveryId`.
      */
     mapping(address account => uint256 nonce) internal _recoveryNonce;
 
@@ -88,11 +101,6 @@ contract JustaRecoveryManager is IRecoveryManager, ReentrancyGuard {
      * @notice Pending recoveries keyed by `recoveryId`.
      */
     mapping(bytes32 recoveryId => PendingRecovery) internal _pendingRecoveries;
-
-    /**
-     * @notice Per-account approval threshold. `0` means "use the default of 1".
-     */
-    mapping(address account => uint256 threshold) internal _recoveryThreshold;
 
     ////////////////////////////////////////////////////////////////////////
     // MODIFIERS
@@ -124,85 +132,108 @@ contract JustaRecoveryManager is IRecoveryManager, ReentrancyGuard {
         return _recoveryDelayConfigured[account] ? _recoveryDelay[account] : DEFAULT_RECOVERY_DELAY;
     }
 
+    /**
+     * @dev Deterministic id for a `(provider, commitment)` slot.
+     */
+    function _computeSlotId(address provider, bytes calldata commitment) internal pure returns (bytes32) {
+        return keccak256(abi.encode(provider, commitment));
+    }
+
     ////////////////////////////////////////////////////////////////////////
-    // ADMIN FUNCTIONS
+    // SLOT ADMIN
     ////////////////////////////////////////////////////////////////////////
 
     /**
-     * @notice Register a recovery provider for an account.
-     * @dev Callable only by the account itself (msg.sender == account). The account is expected to
-     *      route this call through its ERC-7821 execute path so that its normal owner check
-     *      authorizes the operation. The provider receives a subscribe call with msg.sender = manager
-     *      and the account passed explicitly.
-     * @param account The smart account registering the provider.
-     * @param provider The recovery provider address.
-     * @param data Provider-specific commitment data (forwarded to provider.subscribe).
+     * @notice Register a recovery slot for an account.
+     * @dev Callable only by the account. The same `provider` may be registered with different
+     *      `commitment`s. Reverts if the `(provider, commitment)` slot already exists.
+     * @param account The smart account.
+     * @param provider The recovery provider (a stateless verifier).
+     * @param commitment Provider-specific commitment bytes (e.g. `abi.encode(eoa)`, an email hash).
+     * @return slotId The registered slot's id.
      */
-    function addRecoveryProvider(
+    function addRecoverySlot(
         address account,
         address provider,
-        bytes calldata data
+        bytes calldata commitment
     )
         external
-        payable
-        nonReentrant
         onlyAccount(account)
+        returns (bytes32 slotId)
     {
-        // Reject zero provider
         if (provider == address(0)) {
             revert JustaRecoveryManager_ZeroProvider();
         }
-
-        // Add to the per-account set; EnumerableSet.add returns false on duplicate
-        if (!_providers[account].add(provider)) {
-            revert JustaRecoveryManager_ProviderAlreadyAdded(account, provider);
+        if (commitment.length == 0) {
+            revert JustaRecoveryManager_EmptyCommitment();
         }
 
-        // Forward to the provider, attaching any value sent with the call
-        IJustaRecoveryProvider(provider).subscribe{ value: msg.value }(account, data);
+        slotId = _computeSlotId(provider, commitment);
+        if (!_slotIds[account].add(slotId)) {
+            revert JustaRecoveryManager_SlotAlreadyAdded(account, slotId);
+        }
 
-        emit RecoveryProviderAdded(account, provider);
+        _slots[account][slotId] = RecoverySlot({ provider: provider, commitment: commitment });
+
+        emit RecoverySlotAdded(account, provider, commitment, slotId);
     }
 
     /**
-     * @notice Unregister a recovery provider for an account.
-     * @dev Callable only by the account itself. The provider receives an unsubscribe call with
-     *      msg.sender = manager and the account passed explicitly; the provider is expected to
-     *      delete all data associated with the account.
-     * @param account The smart account unregistering the provider.
-     * @param provider The recovery provider address.
+     * @notice Unregister a recovery slot for an account.
+     * @dev Callable only by the account. Rejected if it would drop the slot count below the threshold,
+     *      unless it removes the last slot (a full opt-out to zero).
+     * @param account The smart account.
+     * @param provider The slot's provider.
+     * @param commitment The slot's commitment.
      */
-    function removeRecoveryProvider(
+    function removeRecoverySlot(
         address account,
-        address provider
+        address provider,
+        bytes calldata commitment
     )
         external
-        payable
-        nonReentrant
         onlyAccount(account)
     {
-        // Remove from the per-account set; EnumerableSet.remove returns false if not present
-        if (!_providers[account].remove(provider)) {
-            revert JustaRecoveryManager_ProviderNotRegistered(account, provider);
+        bytes32 slotId = _computeSlotId(provider, commitment);
+        if (!_slotIds[account].remove(slotId)) {
+            revert JustaRecoveryManager_SlotNotRegistered(account, slotId);
         }
 
-        // Disallow dropping below the threshold (except a full opt-out to zero providers).
-        uint256 newCount = _providers[account].length();
+        // Disallow dropping below the threshold (except a full opt-out to zero slots).
+        uint256 newCount = _slotIds[account].length();
         if (newCount != 0 && newCount < _effectiveThreshold(account)) {
             revert JustaRecoveryManager_RemovalBelowThreshold(newCount, _effectiveThreshold(account));
         }
 
-        // Forward to the provider, attaching any value sent with the call
-        IJustaRecoveryProvider(provider).unsubscribe{ value: msg.value }(account);
+        delete _slots[account][slotId];
 
-        emit RecoveryProviderRemoved(account, provider);
+        emit RecoverySlotRemoved(account, provider, commitment, slotId);
+    }
+
+    /**
+     * @notice Set the per-account approval threshold.
+     * @dev Callable only by the account. Must be within `[1, slotCount]` so a recovery is always
+     *      achievable.
+     * @param account The smart account.
+     * @param threshold The number of distinct slots required to approve a recovery.
+     */
+    function setRecoveryThreshold(address account, uint256 threshold) external onlyAccount(account) {
+        uint256 slotCount = _slotIds[account].length();
+        if (threshold < 1 || threshold > slotCount) {
+            revert JustaRecoveryManager_InvalidThreshold(threshold, slotCount);
+        }
+
+        uint256 oldThreshold = _effectiveThreshold(account);
+        _recoveryThreshold[account] = threshold;
+
+        emit RecoveryThresholdChanged(account, oldThreshold, threshold);
     }
 
     /**
      * @notice Set the per-account recovery delay.
-     * @dev Callable only by the account. No minimum — `0` is allowed and means instant. Reverts only
-     *      if above `MAX_RECOVERY_DELAY`. Marks the account as having configured a delay (so the
-     *      default no longer applies). Pending recoveries keep their original `executeAt`.
+     * @dev Callable only by the account. No minimum — `0` is allowed and means instant. Reverts only if
+     *      above `MAX_RECOVERY_DELAY`. Marks the account as having configured a delay. Pending recoveries
+     *      keep their original `executeAt`.
      * @param account The smart account.
      * @param delaySeconds The new delay in seconds (`0` = instant).
      */
@@ -218,88 +249,72 @@ contract JustaRecoveryManager is IRecoveryManager, ReentrancyGuard {
         emit RecoveryDelayChanged(account, oldDelay, delaySeconds);
     }
 
-    /**
-     * @notice Set the per-account approval threshold.
-     * @dev Callable only by the account. Must be within `[1, providerCount]` so a recovery is always
-     *      achievable. With a single provider the only valid value is 1 (the default).
-     * @param account The smart account.
-     * @param threshold The number of distinct providers required to approve a recovery.
-     */
-    function setRecoveryThreshold(address account, uint256 threshold) external onlyAccount(account) {
-        uint256 providerCount = _providers[account].length();
-        if (threshold < 1 || threshold > providerCount) {
-            revert JustaRecoveryManager_InvalidThreshold(threshold, providerCount);
-        }
-
-        uint256 oldThreshold = _effectiveThreshold(account);
-        _recoveryThreshold[account] = threshold;
-
-        emit RecoveryThresholdChanged(account, oldThreshold, threshold);
-    }
-
     ////////////////////////////////////////////////////////////////////////
-    // EXECUTION FUNCTIONS
+    // EXECUTION
     ////////////////////////////////////////////////////////////////////////
 
     /**
-     * @notice Queue a recovery for an account once enough providers have approved the same new owner.
+     * @notice Queue a recovery once the threshold of distinct slots have approved the same new owner.
      * @dev Unrestricted caller; the proofs carry authorization. Requires exactly
-     *      `recoveryThreshold(account)` distinct, registered providers to each verify a proof over the
-     *      same `subject`. `subject` must be a 32-byte EOA owner or a 64-byte passkey owner.
+     *      `recoveryThreshold(account)` distinct, registered slots, each verifying a proof over the same
+     *      `subject` and the account's current `recoveryNonce`. `subject` must be a 32-byte EOA owner or a
+     *      64-byte passkey owner. The nonce is bumped on success, making the proofs single-use.
      * @param account The smart account to recover.
      * @param subject ABI-encoded new owner: `abi.encode(address)` (32B) or `abi.encode(bytes32 x, bytes32 y)` (64B).
-     * @param providers The registered providers approving this recovery (length must equal the threshold).
-     * @param proofs Provider-specific proofs, index-aligned with `providers`.
+     * @param approvals One approval per required slot: the `(provider, commitment)` slot plus its proof.
      * @return recoveryId A deterministic id for the queued recovery.
      */
     function initiateRecovery(
         address account,
         bytes calldata subject,
-        address[] calldata providers,
-        bytes[] calldata proofs
+        Approval[] calldata approvals
     )
         external
         nonReentrant
         returns (bytes32 recoveryId)
     {
-        if (providers.length != proofs.length) {
-            revert JustaRecoveryManager_LengthMismatch(providers.length, proofs.length);
-        }
-
         uint256 required = _effectiveThreshold(account);
-        if (providers.length != required) {
-            revert JustaRecoveryManager_InvalidProofCount(providers.length, required);
+        if (approvals.length != required) {
+            revert JustaRecoveryManager_InvalidApprovalCount(approvals.length, required);
         }
 
         if (subject.length != 32 && subject.length != 64) {
             revert JustaRecoveryManager_InvalidSubjectLength(subject.length);
         }
 
-        for (uint256 i = 0; i < providers.length; ++i) {
-            address provider = providers[i];
+        uint256 nonce = _recoveryNonce[account];
 
-            // Must be a registered provider for this account.
-            if (!_providers[account].contains(provider)) {
-                revert JustaRecoveryManager_ProviderNotRegistered(account, provider);
+        bytes32[] memory seen = new bytes32[](approvals.length);
+        for (uint256 i = 0; i < approvals.length; ++i) {
+            Approval calldata approval = approvals[i];
+            bytes32 slotId = _computeSlotId(approval.provider, approval.commitment);
+
+            // Must be a registered slot for this account.
+            if (!_slotIds[account].contains(slotId)) {
+                revert JustaRecoveryManager_SlotNotRegistered(account, slotId);
             }
 
-            // Must be distinct from every earlier entry.
+            // Must be distinct from every earlier approval.
             for (uint256 j = 0; j < i; ++j) {
-                if (providers[j] == provider) {
-                    revert JustaRecoveryManager_DuplicateProvider(provider);
+                if (seen[j] == slotId) {
+                    revert JustaRecoveryManager_DuplicateSlot(slotId);
                 }
             }
+            seen[i] = slotId;
 
-            // Delegate proof verification; provider reverts on an invalid proof and bumps its own nonce.
-            IJustaRecoveryProvider(provider).recover(account, subject, proofs[i]);
+            // Delegate verification; the provider reverts on an invalid proof. Membership above
+            // guarantees `commitment` matches the registered slot, so the verified commitment is trusted.
+            IJustaRecoveryProvider(approval.provider)
+                .verify(account, subject, nonce, approval.commitment, approval.proof);
         }
 
-        recoveryId = keccak256(abi.encode(account, subject, _recoveryNonce[account]++));
+        recoveryId = keccak256(abi.encode(account, subject, nonce));
+        _recoveryNonce[account] = nonce + 1;
 
         uint64 executeAt = uint64(block.timestamp + _effectiveDelay(account));
         _pendingRecoveries[recoveryId] = PendingRecovery({ account: account, executeAt: executeAt, subject: subject });
 
-        emit RecoveryInitiated(account, recoveryId, providers, subject, executeAt);
+        emit RecoveryInitiated(account, recoveryId, subject, executeAt);
     }
 
     /**
@@ -313,21 +328,21 @@ contract JustaRecoveryManager is IRecoveryManager, ReentrancyGuard {
     function executeRecovery(bytes32 recoveryId) external nonReentrant {
         PendingRecovery storage rec = _pendingRecoveries[recoveryId];
 
-        // Confirm the recovery exists
+        // Confirm the recovery exists.
         if (rec.account == address(0)) {
             revert JustaRecoveryManager_RecoveryNotPending(recoveryId);
         }
 
-        // Confirm the delay has elapsed
+        // Confirm the delay has elapsed.
         if (block.timestamp < rec.executeAt) {
             revert JustaRecoveryManager_RecoveryNotReady(recoveryId, rec.executeAt);
         }
 
-        // Snapshot fields to memory before deletion
+        // Snapshot fields to memory before deletion.
         address account = rec.account;
         bytes memory subject = rec.subject;
 
-        // Delete the pending entry first (CEI)
+        // Delete the pending entry first (CEI).
         delete _pendingRecoveries[recoveryId];
 
         // Register the new owner. `subject` length selects the owner type (validated at initiate):
@@ -348,19 +363,17 @@ contract JustaRecoveryManager is IRecoveryManager, ReentrancyGuard {
     /**
      * @notice Cancel a queued recovery before it executes.
      * @dev Callable only by the account named in the pending recovery (msg.sender == pending.account).
-     *      The account authorizes this through its execute path, so any current owner can veto a
-     *      malicious recovery during the delay window.
      * @param recoveryId The id of the pending recovery to cancel.
      */
     function cancelRecovery(bytes32 recoveryId) external {
         PendingRecovery storage rec = _pendingRecoveries[recoveryId];
 
-        // Confirm the recovery exists
+        // Confirm the recovery exists.
         if (rec.account == address(0)) {
             revert JustaRecoveryManager_RecoveryNotPending(recoveryId);
         }
 
-        // Only the account that the recovery is for may cancel it
+        // Only the account that the recovery is for may cancel it.
         if (msg.sender != rec.account) {
             revert JustaRecoveryManager_NotAccount(msg.sender, rec.account);
         }
@@ -376,45 +389,64 @@ contract JustaRecoveryManager is IRecoveryManager, ReentrancyGuard {
     ////////////////////////////////////////////////////////////////////////
 
     /**
-     * @notice Check whether a provider is registered for an account.
-     * @param account The smart account.
-     * @param provider The recovery provider.
-     * @return True if the provider is registered for the account.
+     * @notice The deterministic id for a `(provider, commitment)` slot.
      */
-    function recoveryProviderAdded(address account, address provider) external view returns (bool) {
-        return _providers[account].contains(provider);
+    function computeSlotId(address provider, bytes calldata commitment) external pure returns (bytes32) {
+        return _computeSlotId(provider, commitment);
     }
 
     /**
-     * @notice Get the list of recovery providers registered for an account.
-     * @param account The smart account.
-     * @return The list of provider addresses.
+     * @notice Whether a `(provider, commitment)` slot is registered for an account.
      */
-    function getRecoveryProviders(address account) external view returns (address[] memory) {
-        return _providers[account].values();
+    function hasRecoverySlot(address account, address provider, bytes calldata commitment)
+        external
+        view
+        returns (bool)
+    {
+        return _slotIds[account].contains(_computeSlotId(provider, commitment));
     }
 
     /**
-     * @notice Read the account's effective recovery delay in seconds (the 24h default if never set).
-     * @param account The smart account.
-     * @return The effective delay in seconds.
+     * @notice The recovery slots registered for an account.
      */
-    function recoveryDelay(address account) external view returns (uint256) {
-        return _effectiveDelay(account);
+    function getRecoverySlots(address account) external view returns (RecoverySlot[] memory slots) {
+        bytes32[] memory ids = _slotIds[account].values();
+        slots = new RecoverySlot[](ids.length);
+        for (uint256 i = 0; i < ids.length; ++i) {
+            slots[i] = _slots[account][ids[i]];
+        }
     }
 
     /**
-     * @notice Read the account's effective approval threshold (1 if never set).
-     * @param account The smart account.
-     * @return The number of distinct providers required to approve a recovery.
+     * @notice The number of recovery slots registered for an account.
+     */
+    function recoverySlotCount(address account) external view returns (uint256) {
+        return _slotIds[account].length();
+    }
+
+    /**
+     * @notice The account's effective approval threshold (1 if never set).
      */
     function recoveryThreshold(address account) external view returns (uint256) {
         return _effectiveThreshold(account);
     }
 
     /**
-     * @notice Read the details of a pending recovery.
-     * @dev Returns zero / empty values if `recoveryId` is not currently pending.
+     * @notice The account's effective recovery delay in seconds (the 24h default until explicitly set).
+     */
+    function recoveryDelay(address account) external view returns (uint256) {
+        return _effectiveDelay(account);
+    }
+
+    /**
+     * @notice The account's current recovery (replay) nonce.
+     */
+    function recoveryNonce(address account) external view returns (uint256) {
+        return _recoveryNonce[account];
+    }
+
+    /**
+     * @notice The details of a pending recovery. Returns zero / empty values if not pending.
      * @param recoveryId The recovery id.
      * @return account The smart account being recovered.
      * @return executeAt The timestamp at which the recovery becomes executable.
