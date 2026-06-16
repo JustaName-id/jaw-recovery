@@ -152,7 +152,7 @@ contract JustaRecoveryManager is IRecoveryManager, ReentrancyGuard {
 
         _recoveries[account][recoveryId] = Recovery({ provider: provider, commitment: commitment, delay: delay });
 
-        emit RecoveryAdded(account, provider, commitment, delay, recoveryId);
+        emit RecoveryAdded(account, delay, recoveryId);
     }
 
     /**
@@ -160,18 +160,9 @@ contract JustaRecoveryManager is IRecoveryManager, ReentrancyGuard {
      * @dev Callable only by the account. Rejected if it would drop the recovery count below the threshold,
      *      unless it removes the last recovery (a full opt-out to zero).
      * @param account The smart account.
-     * @param provider The recovery's provider.
-     * @param commitment The recovery's commitment.
+     * @param recoveryId The recovery id to remove.
      */
-    function removeRecovery(
-        address account,
-        address provider,
-        bytes calldata commitment
-    )
-        external
-        onlyAccount(account)
-    {
-        bytes32 recoveryId = _computeRecoveryId(provider, commitment);
+    function removeRecovery(address account, bytes32 recoveryId) external onlyAccount(account) {
         // Remove first, then validate the resulting count; a failed check reverts the whole tx and undoes
         // the removal, so reading the post-removal length directly is safe and avoids `length - 1` math.
         if (!_recoveryIds[account].remove(recoveryId)) {
@@ -187,7 +178,7 @@ contract JustaRecoveryManager is IRecoveryManager, ReentrancyGuard {
 
         delete _recoveries[account][recoveryId];
 
-        emit RecoveryRemoved(account, provider, commitment, recoveryId);
+        emit RecoveryRemoved(account, recoveryId);
     }
 
     /**
@@ -249,8 +240,7 @@ contract JustaRecoveryManager is IRecoveryManager, ReentrancyGuard {
         uint256 maxDelay;
         bytes32[] memory recoveryIds = new bytes32[](approvals.length);
         for (uint256 i = 0; i < approvals.length; ++i) {
-            Approval calldata approval = approvals[i];
-            bytes32 recoveryId = _computeRecoveryId(approval.provider, approval.commitment);
+            bytes32 recoveryId = approvals[i].recoveryId;
 
             // Must be a registered recovery for this account.
             if (!_recoveryIds[account].contains(recoveryId)) {
@@ -265,16 +255,18 @@ contract JustaRecoveryManager is IRecoveryManager, ReentrancyGuard {
             }
             recoveryIds[i] = recoveryId;
 
+            // Load the registered recovery; its `(provider, commitment)` are trusted (set at add time and
+            // proven registered above), so verification cannot be steered by caller-supplied data.
+            Recovery storage recovery = _recoveries[account][recoveryId];
+
             // The queued delay is the largest among the approving recoveries.
-            uint256 delay = _recoveries[account][recoveryId].delay;
-            if (delay > maxDelay) {
-                maxDelay = delay;
+            if (recovery.delay > maxDelay) {
+                maxDelay = recovery.delay;
             }
 
-            // Delegate verification; the provider reverts on an invalid proof. Membership above guarantees
-            // `commitment` matches the registered recovery, so the verified commitment is trusted.
-            IJustaRecoveryProvider(approval.provider)
-                .verify(account, subject, nonce, approval.commitment, approval.proof);
+            // Delegate verification; the provider reverts on an invalid proof.
+            IJustaRecoveryProvider(recovery.provider)
+                .verify(account, subject, nonce, recovery.commitment, approvals[i].proof);
         }
 
         requestId = keccak256(abi.encode(account, subject, nonce));
@@ -367,10 +359,10 @@ contract JustaRecoveryManager is IRecoveryManager, ReentrancyGuard {
     }
 
     /**
-     * @notice Whether a `(provider, commitment)` recovery is registered for an account.
+     * @notice Whether a recovery id is registered for an account.
      */
-    function hasRecovery(address account, address provider, bytes calldata commitment) external view returns (bool) {
-        return _recoveryIds[account].contains(_computeRecoveryId(provider, commitment));
+    function hasRecovery(address account, bytes32 recoveryId) external view returns (bool) {
+        return _recoveryIds[account].contains(recoveryId);
     }
 
     /**
@@ -382,6 +374,15 @@ contract JustaRecoveryManager is IRecoveryManager, ReentrancyGuard {
         for (uint256 i = 0; i < ids.length; ++i) {
             recoveries[i] = _recoveries[account][ids[i]];
         }
+    }
+
+    /**
+     * @notice A single registered recovery by id.
+     * @dev Returns a zeroed `Recovery` (`provider == address(0)`) if the id is not registered for the
+     *      account; pair with `hasRecovery` when the distinction matters.
+     */
+    function getRecovery(address account, bytes32 recoveryId) external view returns (Recovery memory) {
+        return _recoveries[account][recoveryId];
     }
 
     /**

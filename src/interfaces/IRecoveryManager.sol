@@ -40,12 +40,11 @@ interface IRecoveryManager {
 
     /**
      * @notice One recovery's approval submitted to `requestRecovery`.
-     * @dev `provider` + `commitment` must identify a registered recovery; `proof` is verified by that
-     *      provider.
+     * @dev `recoveryId` must identify a registered recovery for the account; the manager looks up its
+     *      stored `(provider, commitment)` and verifies `proof` against them.
      */
     struct Approval {
-        address provider;
-        bytes commitment;
+        bytes32 recoveryId;
         bytes proof;
     }
 
@@ -143,16 +142,13 @@ interface IRecoveryManager {
     ////////////////////////////////////////////////////////////////////////
 
     /**
-     * @dev `RecoveryAdded` is the canonical `recoveryId` -> `(provider, commitment, delay)` registry:
-     *      it announces the full preimage once. Later events reference recoveries by id only; resolve an
-     *      id by filtering `RecoveryAdded` on the indexed `recoveryId` topic.
+     * @dev Events reference recoveries by `recoveryId` only. A `recoveryId` is `keccak256` of its
+     *      `(provider, commitment)` and is not reversible on-chain; resolve it to a provider/commitment via
+     *      `getRecoveries(account)` (current registrations). Callers that need the preimage of a removed
+     *      recovery must retain it off-chain at `addRecovery` time.
      */
-    event RecoveryAdded(
-        address indexed account, address indexed provider, bytes commitment, uint32 delay, bytes32 indexed recoveryId
-    );
-    event RecoveryRemoved(
-        address indexed account, address indexed provider, bytes commitment, bytes32 indexed recoveryId
-    );
+    event RecoveryAdded(address indexed account, uint32 delay, bytes32 indexed recoveryId);
+    event RecoveryRemoved(address indexed account, bytes32 indexed recoveryId);
     event RecoveryThresholdChanged(address indexed account, uint256 oldThreshold, uint256 newThreshold);
     event RecoveryRequested(
         address indexed account, bytes32 indexed requestId, bytes32[] recoveryIds, bytes subject, uint64 executeAt
@@ -190,10 +186,9 @@ interface IRecoveryManager {
      * @dev Callable only by the account. Rejected if it would drop the recovery count below the threshold,
      *      unless it removes the last recovery (a full opt-out to zero).
      * @param account The smart account.
-     * @param provider The recovery's provider.
-     * @param commitment The recovery's commitment.
+     * @param recoveryId The recovery id to remove (`keccak256(abi.encode(provider, commitment))`).
      */
-    function removeRecovery(address account, address provider, bytes calldata commitment) external;
+    function removeRecovery(address account, bytes32 recoveryId) external;
 
     /**
      * @notice Set the per-account approval threshold (how many recoveries must approve a request).
@@ -217,7 +212,7 @@ interface IRecoveryManager {
      *      recoveries. The nonce is bumped on success, making the proofs single-use.
      * @param account The smart account to recover.
      * @param subject ABI-encoded new owner: `abi.encode(address)` (32B) or `abi.encode(bytes32 x, bytes32 y)` (64B).
-     * @param approvals One approval per required recovery: the `(provider, commitment)` recovery plus its proof.
+     * @param approvals One approval per required recovery: the recovery's id plus its proof.
      * @return requestId A deterministic id for the queued recovery request.
      */
     function requestRecovery(
@@ -255,14 +250,24 @@ interface IRecoveryManager {
     function computeRecoveryId(address provider, bytes calldata commitment) external pure returns (bytes32);
 
     /**
-     * @notice Whether a `(provider, commitment)` recovery is registered for an account.
+     * @notice Whether a recovery id is registered for an account.
      */
-    function hasRecovery(address account, address provider, bytes calldata commitment) external view returns (bool);
+    function hasRecovery(address account, bytes32 recoveryId) external view returns (bool);
 
     /**
      * @notice The recoveries registered for an account.
      */
     function getRecoveries(address account) external view returns (Recovery[] memory);
+
+    /**
+     * @notice A single registered recovery by id.
+     * @dev Returns a zeroed `Recovery` (`provider == address(0)`) if the id is not registered for the
+     *      account; pair with `hasRecovery` when the distinction matters.
+     * @param account The smart account.
+     * @param recoveryId The recovery id.
+     * @return The registered recovery (`provider`, `commitment`, `delay`).
+     */
+    function getRecovery(address account, bytes32 recoveryId) external view returns (Recovery memory);
 
     /**
      * @notice The number of recoveries registered for an account.
