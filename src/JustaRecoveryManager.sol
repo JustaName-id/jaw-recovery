@@ -37,6 +37,20 @@ contract JustaRecoveryManager is IRecoveryManager, ReentrancyGuard {
     ////////////////////////////////////////////////////////////////////////
 
     /**
+     * @notice Per-account recovery configuration and replay nonce, packed into a single storage slot.
+     * @dev `uint64` is ample for every field: `delay` is bounded by `MAX_RECOVERY_DELAY`, and
+     *      `threshold`/`nonce` each grow by at most one per transaction. Sentinels: `threshold == 0`
+     *      means "use the default of 1"; `delayConfigured == false` means `DEFAULT_RECOVERY_DELAY`
+     *      applies (once configured, the stored `delay` applies, including 0 = instant).
+     */
+    struct AccountConfig {
+        uint64 delay;
+        bool delayConfigured;
+        uint64 threshold;
+        uint64 nonce;
+    }
+
+    /**
      * @notice A queued recovery awaiting execution.
      * @dev `account == address(0)` is the sentinel for "not present."
      */
@@ -75,27 +89,11 @@ contract JustaRecoveryManager is IRecoveryManager, ReentrancyGuard {
     mapping(address account => mapping(bytes32 slotId => RecoverySlot slot)) internal _slots;
 
     /**
-     * @notice Per-account recovery delay override in seconds. Only meaningful when
-     *         `_recoveryDelayConfigured[account]` is true; otherwise `DEFAULT_RECOVERY_DELAY` applies.
+     * @notice Per-account configuration (delay override + approval threshold) and replay nonce. The
+     *         nonce is bound into every proof and bumped on each successful initiation, which makes
+     *         proofs single-use; it also seeds the deterministic `recoveryId`.
      */
-    mapping(address account => uint256 delaySeconds) internal _recoveryDelay;
-
-    /**
-     * @notice Whether the account has explicitly set a delay. When false, `DEFAULT_RECOVERY_DELAY`
-     *         applies; when true, the stored `_recoveryDelay` value applies (including 0 = instant).
-     */
-    mapping(address account => bool configured) internal _recoveryDelayConfigured;
-
-    /**
-     * @notice Per-account approval threshold. `0` means "use the default of 1".
-     */
-    mapping(address account => uint256 threshold) internal _recoveryThreshold;
-
-    /**
-     * @notice Per-account replay nonce. Bound into every proof and bumped on each successful initiation,
-     *         which makes proofs single-use. Also seeds the deterministic `recoveryId`.
-     */
-    mapping(address account => uint256 nonce) internal _recoveryNonce;
+    mapping(address account => AccountConfig config) internal _config;
 
     /**
      * @notice Pending recoveries keyed by `recoveryId`.
@@ -121,7 +119,7 @@ contract JustaRecoveryManager is IRecoveryManager, ReentrancyGuard {
      * @dev Effective approval threshold for an account (`0` stored => default `1`).
      */
     function _effectiveThreshold(address account) internal view returns (uint256) {
-        uint256 threshold = _recoveryThreshold[account];
+        uint256 threshold = _config[account].threshold;
         return threshold == 0 ? 1 : threshold;
     }
 
@@ -129,7 +127,8 @@ contract JustaRecoveryManager is IRecoveryManager, ReentrancyGuard {
      * @dev Effective recovery delay: the stored value if the account configured one, else the default.
      */
     function _effectiveDelay(address account) internal view returns (uint256) {
-        return _recoveryDelayConfigured[account] ? _recoveryDelay[account] : DEFAULT_RECOVERY_DELAY;
+        AccountConfig storage config = _config[account];
+        return config.delayConfigured ? config.delay : DEFAULT_RECOVERY_DELAY;
     }
 
     /**
@@ -224,7 +223,9 @@ contract JustaRecoveryManager is IRecoveryManager, ReentrancyGuard {
         }
 
         uint256 oldThreshold = _effectiveThreshold(account);
-        _recoveryThreshold[account] = threshold;
+        // Cast is safe: `threshold <= slotCount`, and every slot costs a prior transaction to add,
+        // so the count can never approach 2^64.
+        _config[account].threshold = uint64(threshold);
 
         emit RecoveryThresholdChanged(account, oldThreshold, threshold);
     }
@@ -239,12 +240,13 @@ contract JustaRecoveryManager is IRecoveryManager, ReentrancyGuard {
      */
     function setRecoveryDelay(address account, uint256 delaySeconds) external onlyAccount(account) {
         if (delaySeconds > MAX_RECOVERY_DELAY) {
-            revert JustaRecoveryManager_DelayOutOfBounds(delaySeconds, 0, MAX_RECOVERY_DELAY);
+            revert JustaRecoveryManager_DelayOutOfBounds(delaySeconds, MAX_RECOVERY_DELAY);
         }
 
         uint256 oldDelay = _effectiveDelay(account);
-        _recoveryDelay[account] = delaySeconds;
-        _recoveryDelayConfigured[account] = true;
+        AccountConfig storage config = _config[account];
+        config.delay = uint64(delaySeconds); // Cast is safe: bounded by `MAX_RECOVERY_DELAY` above.
+        config.delayConfigured = true;
 
         emit RecoveryDelayChanged(account, oldDelay, delaySeconds);
     }
@@ -282,7 +284,7 @@ contract JustaRecoveryManager is IRecoveryManager, ReentrancyGuard {
             revert JustaRecoveryManager_InvalidSubjectLength(subject.length);
         }
 
-        uint256 nonce = _recoveryNonce[account];
+        uint256 nonce = _config[account].nonce;
 
         bytes32[] memory seen = new bytes32[](approvals.length);
         for (uint256 i = 0; i < approvals.length; ++i) {
@@ -309,12 +311,13 @@ contract JustaRecoveryManager is IRecoveryManager, ReentrancyGuard {
         }
 
         recoveryId = keccak256(abi.encode(account, subject, nonce));
-        _recoveryNonce[account] = nonce + 1;
+        // Cast is safe: the nonce increments once per successful initiation.
+        _config[account].nonce = uint64(nonce + 1);
 
         uint64 executeAt = uint64(block.timestamp + _effectiveDelay(account));
         _pendingRecoveries[recoveryId] = PendingRecovery({ account: account, executeAt: executeAt, subject: subject });
 
-        emit RecoveryInitiated(account, recoveryId, subject, executeAt);
+        emit RecoveryInitiated(account, recoveryId, seen, subject, executeAt);
     }
 
     /**
@@ -442,7 +445,7 @@ contract JustaRecoveryManager is IRecoveryManager, ReentrancyGuard {
      * @notice The account's current recovery (replay) nonce.
      */
     function recoveryNonce(address account) external view returns (uint256) {
-        return _recoveryNonce[account];
+        return _config[account].nonce;
     }
 
     /**

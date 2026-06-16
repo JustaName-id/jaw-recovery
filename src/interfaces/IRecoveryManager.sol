@@ -88,10 +88,9 @@ interface IRecoveryManager {
     /**
      * @notice Thrown when `setRecoveryDelay` is called with a value above the allowed maximum.
      * @param requested The requested delay in seconds.
-     * @param min The minimum allowed delay in seconds (0).
      * @param max The maximum allowed delay in seconds.
      */
-    error JustaRecoveryManager_DelayOutOfBounds(uint256 requested, uint256 min, uint256 max);
+    error JustaRecoveryManager_DelayOutOfBounds(uint256 requested, uint256 max);
 
     /**
      * @notice Thrown when a threshold is outside `[1, slotCount]`.
@@ -145,7 +144,9 @@ interface IRecoveryManager {
     );
     event RecoveryThresholdChanged(address indexed account, uint256 oldThreshold, uint256 newThreshold);
     event RecoveryDelayChanged(address indexed account, uint256 oldDelay, uint256 newDelay);
-    event RecoveryInitiated(address indexed account, bytes32 indexed recoveryId, bytes subject, uint64 executeAt);
+    event RecoveryInitiated(
+        address indexed account, bytes32 indexed recoveryId, bytes32[] slotIds, bytes subject, uint64 executeAt
+    );
     event RecoveryExecuted(address indexed account, bytes32 indexed recoveryId, bytes subject);
     event RecoveryCancelled(address indexed account, bytes32 indexed recoveryId);
 
