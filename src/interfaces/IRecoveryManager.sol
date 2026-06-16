@@ -5,18 +5,20 @@ pragma solidity 0.8.30;
  * @title IRecoveryManager
  *
  * @notice Per-many-accounts recovery coordinator. A single JustaRecoveryManager singleton serves all
- * JustanAccount instances, so every function takes an explicit `account`.
+ * JustanAccount instances, so every account-scoped function takes an explicit `account`.
  *
- * The unit of recovery is a "slot": a `(provider, commitment)` pair. The same provider may back several
- * slots for one account (e.g. two ECDSA EOAs, or two committed emails). The manager owns the slots, the
- * per-account replay nonce, the approval threshold, and the time-lock delay; providers are stateless
- * verifiers (see {IJustaRecoveryProvider}).
+ * The unit of recovery is a "recovery": a `(provider, commitment)` pair plus a per-recovery time-lock
+ * `delay`. The same provider may back several recoveries for one account (e.g. two ECDSA EOAs, or two
+ * committed emails), each with its own delay. The manager owns the recoveries, the per-account replay
+ * nonce, and the approval threshold; providers are stateless verifiers (see {IJustaRecoveryProvider}).
  *
- * Recovery is a two-step time-locked flow:
- *   1. `initiateRecovery` verifies one proof per slot for the account's threshold of distinct slots, then
- *      queues a `PendingRecovery` with `executeAt = block.timestamp + recoveryDelay(account)`.
- *   2. After the delay elapses, anyone may call `executeRecovery` to register the new owner.
- * During the delay window the account itself may call `cancelRecovery` to abort.
+ * Recovery is a two-step time-locked flow built around a "recovery request":
+ *   1. `requestRecovery` verifies one proof per recovery for the account's threshold of distinct
+ *      recoveries, then queues a `RecoveryRequest` with `executeAt = block.timestamp + maxDelay`, where
+ *      `maxDelay` is the largest delay among the approving recoveries (the request is only as fast as its
+ *      most-cautious approving factor).
+ *   2. After the delay elapses, anyone may call `executeRecoveryRequest` to register the new owner.
+ * During the delay window the account itself may call `cancelRecoveryRequest` to abort.
  *
  * @author JustaLab
  */
@@ -27,16 +29,19 @@ interface IRecoveryManager {
     ////////////////////////////////////////////////////////////////////////
 
     /**
-     * @notice A registered recovery slot: a provider paired with a commitment it verifies against.
+     * @notice A registered recovery: a provider paired with a commitment it verifies against, plus the
+     *         time-lock delay applied when this recovery participates in a request.
      */
-    struct RecoverySlot {
+    struct Recovery {
         address provider;
         bytes commitment;
+        uint32 delay;
     }
 
     /**
-     * @notice One slot's approval submitted to `initiateRecovery`.
-     * @dev `provider` + `commitment` must identify a registered slot; `proof` is verified by that provider.
+     * @notice One recovery's approval submitted to `requestRecovery`.
+     * @dev `provider` + `commitment` must identify a registered recovery; `proof` is verified by that
+     *      provider.
      */
     struct Approval {
         address provider;
@@ -54,29 +59,37 @@ interface IRecoveryManager {
     error JustaRecoveryManager_ZeroProvider();
 
     /**
+     * @notice Thrown when the provider address has no contract code (e.g. an EOA or a typo). Checking at
+     *         registration moves the failure here, while the account can still fix it, rather than to
+     *         recovery time when the account is locked out.
+     * @param provider The offending provider address.
+     */
+    error JustaRecoveryManager_ProviderNotContract(address provider);
+
+    /**
      * @notice Thrown when the commitment is empty.
      */
     error JustaRecoveryManager_EmptyCommitment();
 
     /**
-     * @notice Thrown when adding a slot that is already registered for the account.
+     * @notice Thrown when adding a recovery that is already registered for the account.
      * @param account The smart account.
-     * @param slotId The slot id (`keccak256(abi.encode(provider, commitment))`).
+     * @param recoveryId The recovery id (`keccak256(abi.encode(provider, commitment))`).
      */
-    error JustaRecoveryManager_SlotAlreadyAdded(address account, bytes32 slotId);
+    error JustaRecoveryManager_RecoveryAlreadyAdded(address account, bytes32 recoveryId);
 
     /**
-     * @notice Thrown when the slot is not registered for the account.
+     * @notice Thrown when the recovery is not registered for the account.
      * @param account The smart account.
-     * @param slotId The slot id.
+     * @param recoveryId The recovery id.
      */
-    error JustaRecoveryManager_SlotNotRegistered(address account, bytes32 slotId);
+    error JustaRecoveryManager_RecoveryNotRegistered(address account, bytes32 recoveryId);
 
     /**
-     * @notice Thrown when the same slot appears more than once in `initiateRecovery`.
-     * @param slotId The duplicated slot id.
+     * @notice Thrown when the same recovery appears more than once in `requestRecovery`.
+     * @param recoveryId The duplicated recovery id.
      */
-    error JustaRecoveryManager_DuplicateSlot(bytes32 slotId);
+    error JustaRecoveryManager_DuplicateRecovery(bytes32 recoveryId);
 
     /**
      * @notice Thrown when the caller is not the account named in the call.
@@ -86,22 +99,15 @@ interface IRecoveryManager {
     error JustaRecoveryManager_NotAccount(address caller, address account);
 
     /**
-     * @notice Thrown when `setRecoveryDelay` is called with a value above the allowed maximum.
-     * @param requested The requested delay in seconds.
-     * @param max The maximum allowed delay in seconds.
-     */
-    error JustaRecoveryManager_DelayOutOfBounds(uint256 requested, uint256 max);
-
-    /**
-     * @notice Thrown when a threshold is outside `[1, slotCount]`.
+     * @notice Thrown when a threshold is outside `[1, recoveryCount]`.
      * @param requested The requested threshold.
-     * @param slotCount The account's current number of registered slots.
+     * @param recoveryCount The account's current number of registered recoveries.
      */
-    error JustaRecoveryManager_InvalidThreshold(uint256 requested, uint256 slotCount);
+    error JustaRecoveryManager_InvalidThreshold(uint256 requested, uint256 recoveryCount);
 
     /**
-     * @notice Thrown when removing a slot would drop the count below the account's threshold.
-     * @param newCount The slot count that would remain after removal.
+     * @notice Thrown when removing a recovery would drop the count below the account's threshold.
+     * @param newCount The recovery count that would remain after removal.
      * @param threshold The account's current effective threshold.
      */
     error JustaRecoveryManager_RemovalBelowThreshold(uint256 newCount, uint256 threshold);
@@ -120,148 +126,148 @@ interface IRecoveryManager {
     error JustaRecoveryManager_InvalidSubjectLength(uint256 length);
 
     /**
-     * @notice Thrown when a recovery id does not correspond to a pending recovery.
-     * @param recoveryId The recovery id.
+     * @notice Thrown when a request id does not correspond to a pending recovery request.
+     * @param requestId The recovery request id.
      */
-    error JustaRecoveryManager_RecoveryNotPending(bytes32 recoveryId);
+    error JustaRecoveryManager_RequestNotPending(bytes32 requestId);
 
     /**
-     * @notice Thrown when `executeRecovery` is called before the recovery's `executeAt` timestamp.
-     * @param recoveryId The recovery id.
-     * @param executeAt The timestamp at which the recovery becomes executable.
+     * @notice Thrown when `executeRecoveryRequest` is called before the request's `executeAt` timestamp.
+     * @param requestId The recovery request id.
+     * @param executeAt The timestamp at which the request becomes executable.
      */
-    error JustaRecoveryManager_RecoveryNotReady(bytes32 recoveryId, uint64 executeAt);
+    error JustaRecoveryManager_RequestNotReady(bytes32 requestId, uint64 executeAt);
 
     ////////////////////////////////////////////////////////////////////////
     // EVENTS
     ////////////////////////////////////////////////////////////////////////
 
-    event RecoverySlotAdded(
-        address indexed account, address indexed provider, bytes commitment, bytes32 indexed slotId
+    /**
+     * @dev `RecoveryAdded` is the canonical `recoveryId` -> `(provider, commitment, delay)` registry:
+     *      it announces the full preimage once. Later events reference recoveries by id only; resolve an
+     *      id by filtering `RecoveryAdded` on the indexed `recoveryId` topic.
+     */
+    event RecoveryAdded(
+        address indexed account, address indexed provider, bytes commitment, uint32 delay, bytes32 indexed recoveryId
     );
-    event RecoverySlotRemoved(
-        address indexed account, address indexed provider, bytes commitment, bytes32 indexed slotId
+    event RecoveryRemoved(
+        address indexed account, address indexed provider, bytes commitment, bytes32 indexed recoveryId
     );
     event RecoveryThresholdChanged(address indexed account, uint256 oldThreshold, uint256 newThreshold);
-    event RecoveryDelayChanged(address indexed account, uint256 oldDelay, uint256 newDelay);
-    event RecoveryInitiated(
-        address indexed account, bytes32 indexed recoveryId, bytes32[] slotIds, bytes subject, uint64 executeAt
+    event RecoveryRequested(
+        address indexed account, bytes32 indexed requestId, bytes32[] recoveryIds, bytes subject, uint64 executeAt
     );
-    event RecoveryExecuted(address indexed account, bytes32 indexed recoveryId, bytes subject);
-    event RecoveryCancelled(address indexed account, bytes32 indexed recoveryId);
+    event RecoveryRequestExecuted(address indexed account, bytes32 indexed requestId, bytes subject);
+    event RecoveryRequestCancelled(address indexed account, bytes32 indexed requestId);
 
     ////////////////////////////////////////////////////////////////////////
-    // SLOT ADMIN
+    // RECOVERY ADMIN
     ////////////////////////////////////////////////////////////////////////
 
     /**
-     * @notice Register a recovery slot for an account.
+     * @notice Register a recovery for an account.
      * @dev Callable only by the account. The same `provider` may be registered with different
-     *      `commitment`s. Reverts if the `(provider, commitment)` slot already exists.
+     *      `commitment`s. Reverts if the `(provider, commitment)` recovery already exists. To change a
+     *      recovery's `delay`, remove it and add it again.
      * @param account The smart account.
-     * @param provider The recovery provider (a stateless verifier).
+     * @param provider The recovery provider (a stateless verifier); must be a contract.
      * @param commitment Provider-specific commitment bytes (e.g. `abi.encode(eoa)`, an email hash).
-     * @return slotId The registered slot's id (`keccak256(abi.encode(provider, commitment))`).
+     * @param delay The per-recovery time-lock in seconds applied when this recovery approves a request
+     *        (`0` = instant; no upper bound beyond the `uint32` type).
+     * @return recoveryId The registered recovery's id (`keccak256(abi.encode(provider, commitment))`).
      */
-    function addRecoverySlot(
+    function addRecovery(
         address account,
         address provider,
-        bytes calldata commitment
+        bytes calldata commitment,
+        uint32 delay
     )
         external
-        returns (bytes32 slotId);
+        returns (bytes32 recoveryId);
 
     /**
-     * @notice Unregister a recovery slot for an account.
-     * @dev Callable only by the account. Rejected if it would drop the slot count below the threshold,
-     *      unless it removes the last slot (a full opt-out to zero).
+     * @notice Unregister a recovery for an account.
+     * @dev Callable only by the account. Rejected if it would drop the recovery count below the threshold,
+     *      unless it removes the last recovery (a full opt-out to zero).
      * @param account The smart account.
-     * @param provider The slot's provider.
-     * @param commitment The slot's commitment.
+     * @param provider The recovery's provider.
+     * @param commitment The recovery's commitment.
      */
-    function removeRecoverySlot(address account, address provider, bytes calldata commitment) external;
+    function removeRecovery(address account, address provider, bytes calldata commitment) external;
 
     /**
-     * @notice Set the per-account approval threshold (how many slots must approve a recovery).
-     * @dev Callable only by the account. Must be within `[1, recoverySlotCount(account)]`.
+     * @notice Set the per-account approval threshold (how many recoveries must approve a request).
+     * @dev Callable only by the account. Must be within `[1, recoveryCount(account)]`.
      * @param account The smart account.
-     * @param threshold The number of distinct slots required to approve a recovery.
+     * @param threshold The number of distinct recoveries required to approve a request.
      */
     function setRecoveryThreshold(address account, uint256 threshold) external;
-
-    /**
-     * @notice Set the per-account recovery delay.
-     * @dev Callable only by the account. No minimum — `0` means instant. Reverts above
-     *      `MAX_RECOVERY_DELAY`. A 24h default applies until this is explicitly called. Pending
-     *      recoveries keep their original `executeAt`.
-     * @param account The smart account.
-     * @param delaySeconds The new delay in seconds (`0` = instant).
-     */
-    function setRecoveryDelay(address account, uint256 delaySeconds) external;
 
     ////////////////////////////////////////////////////////////////////////
     // EXECUTION
     ////////////////////////////////////////////////////////////////////////
 
     /**
-     * @notice Queue a recovery once the threshold of distinct slots have approved the same new owner.
+     * @notice Queue a recovery request once the threshold of distinct recoveries have approved the same
+     *         new owner.
      * @dev Unrestricted caller; the proofs carry authorization. Requires exactly
-     *      `recoveryThreshold(account)` distinct, registered slots, each verifying a proof over the same
-     *      `subject` and the account's current `recoveryNonce`. `subject` must be a 32-byte EOA owner or
-     *      a 64-byte passkey owner. The nonce is bumped on success, making the proofs single-use.
+     *      `recoveryThreshold(account)` distinct, registered recoveries, each verifying a proof over the
+     *      same `subject` and the account's current `recoveryNonce`. `subject` must be a 32-byte EOA owner
+     *      or a 64-byte passkey owner. The queued `executeAt` uses the largest delay among the approving
+     *      recoveries. The nonce is bumped on success, making the proofs single-use.
      * @param account The smart account to recover.
      * @param subject ABI-encoded new owner: `abi.encode(address)` (32B) or `abi.encode(bytes32 x, bytes32 y)` (64B).
-     * @param approvals One approval per required slot: the `(provider, commitment)` slot plus its proof.
-     * @return recoveryId A deterministic id for the queued recovery.
+     * @param approvals One approval per required recovery: the `(provider, commitment)` recovery plus its proof.
+     * @return requestId A deterministic id for the queued recovery request.
      */
-    function initiateRecovery(
+    function requestRecovery(
         address account,
         bytes calldata subject,
         Approval[] calldata approvals
     )
         external
-        returns (bytes32 recoveryId);
+        returns (bytes32 requestId);
 
     /**
-     * @notice Finalize a queued recovery whose delay has elapsed.
+     * @notice Finalize a queued recovery request whose delay has elapsed.
      * @dev Unrestricted caller. Registers the new owner from `subject` — a 64-byte passkey via
-     *      `addOwnerPublicKey`, or a 32-byte EOA via `addOwnerAddress`. Reverts if the recovery is not
+     *      `addOwnerPublicKey`, or a 32-byte EOA via `addOwnerAddress`. Reverts if the request is not
      *      pending or its `executeAt` has not yet been reached.
-     * @param recoveryId The id returned from `initiateRecovery`.
+     * @param requestId The id returned from `requestRecovery`.
      */
-    function executeRecovery(bytes32 recoveryId) external;
+    function executeRecoveryRequest(bytes32 requestId) external;
 
     /**
-     * @notice Cancel a queued recovery before it executes.
-     * @dev Callable only by the account that the recovery is for (msg.sender == pending.account).
-     * @param recoveryId The id of the pending recovery to cancel.
+     * @notice Cancel a queued recovery request before it executes.
+     * @dev Callable only by the account that the request is for (msg.sender == request.account).
+     * @param requestId The id of the pending recovery request to cancel.
      */
-    function cancelRecovery(bytes32 recoveryId) external;
+    function cancelRecoveryRequest(bytes32 requestId) external;
 
     ////////////////////////////////////////////////////////////////////////
     // VIEW FUNCTIONS
     ////////////////////////////////////////////////////////////////////////
 
     /**
-     * @notice The deterministic id for a `(provider, commitment)` slot.
-     * @return The slot id (`keccak256(abi.encode(provider, commitment))`).
+     * @notice The deterministic id for a `(provider, commitment)` recovery.
+     * @return The recovery id (`keccak256(abi.encode(provider, commitment))`).
      */
-    function computeSlotId(address provider, bytes calldata commitment) external pure returns (bytes32);
+    function computeRecoveryId(address provider, bytes calldata commitment) external pure returns (bytes32);
 
     /**
-     * @notice Whether a `(provider, commitment)` slot is registered for an account.
+     * @notice Whether a `(provider, commitment)` recovery is registered for an account.
      */
-    function hasRecoverySlot(address account, address provider, bytes calldata commitment) external view returns (bool);
+    function hasRecovery(address account, address provider, bytes calldata commitment) external view returns (bool);
 
     /**
-     * @notice The recovery slots registered for an account.
+     * @notice The recoveries registered for an account.
      */
-    function getRecoverySlots(address account) external view returns (RecoverySlot[] memory);
+    function getRecoveries(address account) external view returns (Recovery[] memory);
 
     /**
-     * @notice The number of recovery slots registered for an account.
+     * @notice The number of recoveries registered for an account.
      */
-    function recoverySlotCount(address account) external view returns (uint256);
+    function recoveryCount(address account) external view returns (uint256);
 
     /**
      * @notice The account's effective approval threshold (1 if never set).
@@ -269,23 +275,18 @@ interface IRecoveryManager {
     function recoveryThreshold(address account) external view returns (uint256);
 
     /**
-     * @notice The account's effective recovery delay in seconds (the 24h default until explicitly set).
-     */
-    function recoveryDelay(address account) external view returns (uint256);
-
-    /**
      * @notice The account's current recovery (replay) nonce. Bind this into proofs submitted to
-     *         `initiateRecovery`; it increments on each successful initiation.
+     *         `requestRecovery`; it increments on each successful request.
      */
     function recoveryNonce(address account) external view returns (uint256);
 
     /**
-     * @notice The details of a pending recovery. Returns zero / empty values if not pending.
+     * @notice The details of a pending recovery request. Returns zero / empty values if not pending.
      * @return account The smart account being recovered.
-     * @return executeAt The timestamp at which the recovery becomes executable.
+     * @return executeAt The timestamp at which the request becomes executable.
      * @return subject The new-owner payload.
      */
-    function pendingRecovery(bytes32 recoveryId)
+    function recoveryRequest(bytes32 requestId)
         external
         view
         returns (address account, uint64 executeAt, bytes memory subject);

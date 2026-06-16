@@ -15,7 +15,7 @@ pragma solidity 0.8.30;
  *     target owners. The manager increments `nonce` after every recovery, which makes a proof single-use;
  *   - verify the proof against `commitment`: a proof is valid for exactly one commitment and MUST NOT
  *     pass for any other commitment accepted by this provider. Otherwise one factor could satisfy
- *     several slots of the same provider in one recovery, silently weakening an M-of-N threshold.
+ *     several recoveries of the same provider in one request, silently weakening an M-of-N threshold.
  *
  * Implementations SHOULD be `view` (pure verification) — they are handed all the state they need.
  *
