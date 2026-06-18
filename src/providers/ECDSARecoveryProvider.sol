@@ -4,10 +4,10 @@ pragma solidity 0.8.30;
 import { ECDSA } from "solady/utils/ECDSA.sol";
 import { EIP712 } from "solady/utils/EIP712.sol";
 
-import { IJustaRecoveryProvider } from "../interfaces/IJustaRecoveryProvider.sol";
+import { IRecoveryProvider } from "../interfaces/IRecoveryProvider.sol";
 
 /**
- * @title JustaECDSARecoveryProvider
+ * @title ECDSARecoveryProvider
  *
  * @notice Stateless ECDSA-EOA recovery verifier for JAW accounts. The recovery commitment is an EOA
  * address; the recovery proof is an EIP-712 signature from that EOA over `(account, nonce, subject)`.
@@ -19,7 +19,7 @@ import { IJustaRecoveryProvider } from "../interfaces/IJustaRecoveryProvider.sol
  *
  * @author JustaLab
  */
-contract JustaECDSARecoveryProvider is IJustaRecoveryProvider, EIP712 {
+contract ECDSARecoveryProvider is IRecoveryProvider, EIP712 {
 
     ////////////////////////////////////////////////////////////////////////
     // ERRORS
@@ -28,18 +28,18 @@ contract JustaECDSARecoveryProvider is IJustaRecoveryProvider, EIP712 {
     /**
      * @notice Thrown when the commitment does not decode to a non-zero EOA.
      */
-    error JustaECDSARecoveryProvider_InvalidCommitment();
+    error ECDSARecoveryProvider_InvalidCommitment();
 
     /**
      * @notice Thrown when the proof is not exactly a 65-byte ECDSA signature.
      * @param length The length of the supplied proof.
      */
-    error JustaECDSARecoveryProvider_InvalidProofLength(uint256 length);
+    error ECDSARecoveryProvider_InvalidProofLength(uint256 length);
 
     /**
      * @notice Thrown when the recovered signer does not match the committed EOA.
      */
-    error JustaECDSARecoveryProvider_InvalidSignature();
+    error ECDSARecoveryProvider_InvalidSignature();
 
     ////////////////////////////////////////////////////////////////////////
     // CONSTANTS
@@ -75,18 +75,18 @@ contract JustaECDSARecoveryProvider is IJustaRecoveryProvider, EIP712 {
         // Decode and validate the committed EOA.
         address recoveryEoa = abi.decode(commitment, (address));
         if (recoveryEoa == address(0)) {
-            revert JustaECDSARecoveryProvider_InvalidCommitment();
+            revert ECDSARecoveryProvider_InvalidCommitment();
         }
 
         // Proof must be exactly a 65-byte ECDSA signature.
         if (proof.length != 65) {
-            revert JustaECDSARecoveryProvider_InvalidProofLength(proof.length);
+            revert ECDSARecoveryProvider_InvalidProofLength(proof.length);
         }
 
         // Reconstruct the canonical EIP-712 digest and recover the signer.
         address signer = ECDSA.recover(_recoverDigest(account, nonce, subject), proof);
         if (signer != recoveryEoa) {
-            revert JustaECDSARecoveryProvider_InvalidSignature();
+            revert ECDSARecoveryProvider_InvalidSignature();
         }
     }
 
@@ -122,7 +122,7 @@ contract JustaECDSARecoveryProvider is IJustaRecoveryProvider, EIP712 {
      * @dev EIP-712 domain name and version, consumed by Solady's EIP712 base.
      */
     function _domainNameAndVersion() internal pure override returns (string memory name, string memory version) {
-        name = "JustaECDSARecoveryProvider";
+        name = "ECDSARecoveryProvider";
         version = "1";
     }
 

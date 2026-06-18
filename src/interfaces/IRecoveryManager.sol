@@ -10,7 +10,7 @@ pragma solidity 0.8.30;
  * The unit of recovery is a "recovery": a `(provider, commitment)` pair plus a per-recovery time-lock
  * `delay`. The same provider may back several recoveries for one account (e.g. two ECDSA EOAs, or two
  * committed emails), each with its own delay. The manager owns the recoveries, the per-account replay
- * nonce, and the approval threshold; providers are stateless verifiers (see {IJustaRecoveryProvider}).
+ * nonce, and the approval threshold; providers are stateless verifiers (see {IRecoveryProvider}).
  *
  * Recovery is a two-step time-locked flow built around a "recovery request":
  *   1. `requestRecovery` verifies one proof per recovery for the account's threshold of distinct
@@ -23,30 +23,6 @@ pragma solidity 0.8.30;
  * @author JustaLab
  */
 interface IRecoveryManager {
-
-    ////////////////////////////////////////////////////////////////////////
-    // TYPES
-    ////////////////////////////////////////////////////////////////////////
-
-    /**
-     * @notice A registered recovery: a provider paired with a commitment it verifies against, plus the
-     *         time-lock delay applied when this recovery participates in a request.
-     */
-    struct Recovery {
-        address provider;
-        bytes commitment;
-        uint32 delay;
-    }
-
-    /**
-     * @notice One recovery's approval submitted to `requestRecovery`.
-     * @dev `recoveryId` must identify a registered recovery for the account; the manager looks up its
-     *      stored `(provider, commitment)` and verifies `proof` against them.
-     */
-    struct Approval {
-        bytes32 recoveryId;
-        bytes proof;
-    }
 
     ////////////////////////////////////////////////////////////////////////
     // ERRORS
@@ -136,6 +112,43 @@ interface IRecoveryManager {
      * @param executeAt The timestamp at which the request becomes executable.
      */
     error JustaRecoveryManager_RequestNotReady(bytes32 requestId, uint64 executeAt);
+
+    ////////////////////////////////////////////////////////////////////////
+    // TYPES
+    ////////////////////////////////////////////////////////////////////////
+
+    /**
+     * @notice A registered recovery: a provider paired with a commitment it verifies against, plus the
+     *         time-lock delay applied when this recovery participates in a request.
+     */
+    struct Recovery {
+        address provider;
+        bytes commitment;
+        uint32 delay;
+    }
+
+    /**
+     * @notice One recovery's approval submitted to `requestRecovery`.
+     * @dev `recoveryId` must identify a registered recovery for the account; the manager looks up its
+     *      stored `(provider, commitment)` and verifies `proof` against them.
+     */
+    struct Approval {
+        bytes32 recoveryId;
+        bytes proof;
+    }
+
+    /**
+     * @notice A queued recovery request awaiting execution.
+     * @dev `account == address(0)` is the sentinel for "not present": a request is only written for an
+     *      account that registered a recovery, and registration requires `msg.sender == account`, so
+     *      `address(0)` can never be the subject of a request. The implementation packs `account`
+     *      (20 bytes) and `executeAt` (8 bytes) into one storage slot.
+     */
+    struct RecoveryRequest {
+        address account;
+        uint64 executeAt;
+        bytes subject;
+    }
 
     ////////////////////////////////////////////////////////////////////////
     // EVENTS
@@ -286,14 +299,10 @@ interface IRecoveryManager {
     function recoveryNonce(address account) external view returns (uint256);
 
     /**
-     * @notice The details of a pending recovery request. Returns zero / empty values if not pending.
-     * @return account The smart account being recovered.
-     * @return executeAt The timestamp at which the request becomes executable.
-     * @return subject The new-owner payload.
+     * @notice The details of a pending recovery request (a zeroed `RecoveryRequest` if not pending).
+     * @param requestId The recovery request id.
+     * @return The pending request: `account`, `executeAt`, and the new-owner `subject`.
      */
-    function recoveryRequest(bytes32 requestId)
-        external
-        view
-        returns (address account, uint64 executeAt, bytes memory subject);
+    function recoveryRequest(bytes32 requestId) external view returns (RecoveryRequest memory);
 
 }
