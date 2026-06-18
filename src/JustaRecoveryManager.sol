@@ -19,7 +19,7 @@ import { IRecoveryProvider } from "./interfaces/IRecoveryProvider.sol";
  * or EOA) on the target account.
  *
  * @dev The unit of recovery is a "recovery": a `(provider, commitment)` pair plus a time-lock `delay`,
- *      keyed by `recoveryId = keccak256(abi.encode(provider, commitment))`. The same provider may back
+ *      keyed by `recoveryId = keccak256(abi.encode(account, provider, commitment))`. The same provider may back
  *      several recoveries for one account. The manager owns all state — recoveries & commitments, the
  *      approval threshold, the per-recovery delays, and the per-account replay nonce — and treats
  *      providers as stateless verifiers: on each approval it calls
@@ -38,7 +38,7 @@ contract JustaRecoveryManager is IRecoveryManager, ReentrancyGuard {
     ////////////////////////////////////////////////////////////////////////
 
     /**
-     * @notice Per-account set of registered recovery ids (`keccak256(abi.encode(provider, commitment))`).
+     * @notice Per-account set of registered recovery ids (`keccak256(abi.encode(account, provider, commitment))`).
      */
     mapping(address account => EnumerableSet.Bytes32Set recoveryIds) internal _recoveryIds;
 
@@ -109,7 +109,7 @@ contract JustaRecoveryManager is IRecoveryManager, ReentrancyGuard {
             revert JustaRecoveryManager_EmptyCommitment();
         }
 
-        recoveryId = _computeRecoveryId(provider, commitment);
+        recoveryId = _computeRecoveryId(account, provider, commitment);
         if (!_recoveryIds[account].add(recoveryId)) {
             revert JustaRecoveryManager_RecoveryAlreadyAdded(account, recoveryId);
         }
@@ -316,10 +316,18 @@ contract JustaRecoveryManager is IRecoveryManager, ReentrancyGuard {
     ////////////////////////////////////////////////////////////////////////
 
     /**
-     * @notice The deterministic id for a `(provider, commitment)` recovery.
+     * @notice The deterministic id for an account's `(provider, commitment)` recovery.
      */
-    function computeRecoveryId(address provider, bytes calldata commitment) external pure returns (bytes32) {
-        return _computeRecoveryId(provider, commitment);
+    function computeRecoveryId(
+        address account,
+        address provider,
+        bytes calldata commitment
+    )
+        external
+        pure
+        returns (bytes32)
+    {
+        return _computeRecoveryId(account, provider, commitment);
     }
 
     /**
@@ -392,10 +400,18 @@ contract JustaRecoveryManager is IRecoveryManager, ReentrancyGuard {
     }
 
     /**
-     * @dev Deterministic id for a `(provider, commitment)` recovery.
+     * @dev Deterministic id for an account's `(provider, commitment)` recovery.
      */
-    function _computeRecoveryId(address provider, bytes calldata commitment) internal pure returns (bytes32) {
-        return keccak256(abi.encode(provider, commitment));
+    function _computeRecoveryId(
+        address account,
+        address provider,
+        bytes calldata commitment
+    )
+        internal
+        pure
+        returns (bytes32)
+    {
+        return keccak256(abi.encode(account, provider, commitment));
     }
 
 }

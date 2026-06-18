@@ -49,7 +49,7 @@ interface IRecoveryManager {
     /**
      * @notice Thrown when adding a recovery that is already registered for the account.
      * @param account The smart account.
-     * @param recoveryId The recovery id (`keccak256(abi.encode(provider, commitment))`).
+     * @param recoveryId The recovery id (`keccak256(abi.encode(account, provider, commitment))`).
      */
     error JustaRecoveryManager_RecoveryAlreadyAdded(address account, bytes32 recoveryId);
 
@@ -156,7 +156,7 @@ interface IRecoveryManager {
 
     /**
      * @dev Events reference recoveries by `recoveryId` only. A `recoveryId` is `keccak256` of its
-     *      `(provider, commitment)` and is not reversible on-chain; resolve it to a provider/commitment via
+     *      `(account, provider, commitment)` and is not reversible on-chain; resolve it to a provider/commitment via
      *      `getRecoveries(account)` (current registrations). Callers that need the preimage of a removed
      *      recovery must retain it off-chain at `addRecovery` time.
      */
@@ -183,7 +183,7 @@ interface IRecoveryManager {
      * @param commitment Provider-specific commitment bytes (e.g. `abi.encode(eoa)`, an email hash).
      * @param delay The per-recovery time-lock in seconds applied when this recovery approves a request
      *        (`0` = instant; no upper bound beyond the `uint32` type).
-     * @return recoveryId The registered recovery's id (`keccak256(abi.encode(provider, commitment))`).
+     * @return recoveryId The registered recovery's id (`keccak256(abi.encode(account, provider, commitment))`).
      */
     function addRecovery(
         address account,
@@ -199,7 +199,7 @@ interface IRecoveryManager {
      * @dev Callable only by the account. Rejected if it would drop the recovery count below the threshold,
      *      unless it removes the last recovery (a full opt-out to zero).
      * @param account The smart account.
-     * @param recoveryId The recovery id to remove (`keccak256(abi.encode(provider, commitment))`).
+     * @param recoveryId The recovery id to remove (`keccak256(abi.encode(account, provider, commitment))`).
      */
     function removeRecovery(address account, bytes32 recoveryId) external;
 
@@ -257,10 +257,17 @@ interface IRecoveryManager {
     ////////////////////////////////////////////////////////////////////////
 
     /**
-     * @notice The deterministic id for a `(provider, commitment)` recovery.
-     * @return The recovery id (`keccak256(abi.encode(provider, commitment))`).
+     * @notice The deterministic id for an account's `(provider, commitment)` recovery.
+     * @return The recovery id (`keccak256(abi.encode(account, provider, commitment))`).
      */
-    function computeRecoveryId(address provider, bytes calldata commitment) external pure returns (bytes32);
+    function computeRecoveryId(
+        address account,
+        address provider,
+        bytes calldata commitment
+    )
+        external
+        pure
+        returns (bytes32);
 
     /**
      * @notice Whether a recovery id is registered for an account.
