@@ -109,6 +109,14 @@ interface IRecoveryManager {
     error JustaRecoveryManager_InvalidSubject(bytes subject);
 
     /**
+     * @notice Thrown when `subject` is already an owner of the account at request time. A best-effort
+     *         fail-fast: the owner set can change during the delay, so this does not guarantee
+     *         `executeRecoveryRequest` won't later revert with `MultiOwnable_AlreadyOwner`.
+     * @param subject The new-owner payload that is already registered.
+     */
+    error JustaRecoveryManager_SubjectAlreadyOwner(bytes subject);
+
+    /**
      * @notice Thrown when a request id does not correspond to a pending recovery request.
      * @param requestId The recovery request id.
      */

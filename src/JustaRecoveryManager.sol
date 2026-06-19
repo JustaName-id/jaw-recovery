@@ -197,6 +197,13 @@ contract JustaRecoveryManager is IRecoveryManager, ReentrancyGuard {
 
         _validateSubject(subject);
 
+        // Fail fast if the new owner is already registered (would revert at execute). Best-effort: the
+        // owner set can change during the delay, so this is not a guarantee. `subject` is already the
+        // canonical owner-bytes MultiOwnable keys by, so this covers both EOA and passkey owners.
+        if (MultiOwnable(account).isOwnerBytes(subject)) {
+            revert JustaRecoveryManager_SubjectAlreadyOwner(subject);
+        }
+
         uint256 nonce = _recoveryNonce[account];
 
         uint256 maxDelay;
