@@ -74,11 +74,7 @@ contract ECDSARecoveryProvider is IRecoveryProvider, EIP712 {
         bytes calldata proof
     )
         external
-        view
     {
-        // Require a canonical encoding: exactly 32 bytes so one EOA maps to exactly one commitment.
-        // `abi.decode` ignores trailing bytes, so any other length could alias the same EOA under a
-        // different recovery id and let one signature satisfy several approvals.
         if (commitment.length != 32) {
             revert ECDSARecoveryProvider_InvalidCommitment();
         }
