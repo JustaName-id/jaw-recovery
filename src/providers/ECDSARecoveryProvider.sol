@@ -26,7 +26,11 @@ contract ECDSARecoveryProvider is IRecoveryProvider, EIP712 {
     ////////////////////////////////////////////////////////////////////////
 
     /**
-     * @notice Thrown when the commitment does not decode to a non-zero EOA.
+     * @notice Thrown when the commitment is not a canonical 32-byte ABI-encoded non-zero EOA. The exact
+     *         length is required so a single EOA maps to exactly one commitment: `abi.decode` ignores
+     *         trailing bytes, so without this check `abi.encode(eoa)` and `abi.encode(eoa) || 0x00…` would
+     *         decode to the same EOA under different recovery ids and one signature could satisfy several
+     *         approvals — silently weakening an M-of-N threshold.
      */
     error ECDSARecoveryProvider_InvalidCommitment();
 
@@ -59,7 +63,7 @@ contract ECDSARecoveryProvider is IRecoveryProvider, EIP712 {
      * @param account The smart account being recovered.
      * @param subject The new-owner payload bound by the signature.
      * @param nonce The manager's per-account recovery nonce, bound by the signature for replay safety.
-     * @param commitment ABI-encoded recovery EOA (`abi.encode(address)`).
+     * @param commitment Canonical 32-byte ABI-encoded recovery EOA (`abi.encode(address)`).
      * @param proof A 65-byte ECDSA signature `(r, s, v)` over the canonical digest.
      */
     function verify(
@@ -72,6 +76,13 @@ contract ECDSARecoveryProvider is IRecoveryProvider, EIP712 {
         external
         view
     {
+        // Require a canonical encoding: exactly 32 bytes so one EOA maps to exactly one commitment.
+        // `abi.decode` ignores trailing bytes, so any other length could alias the same EOA under a
+        // different recovery id and let one signature satisfy several approvals.
+        if (commitment.length != 32) {
+            revert ECDSARecoveryProvider_InvalidCommitment();
+        }
+
         // Decode and validate the committed EOA.
         address recoveryEoa = abi.decode(commitment, (address));
         if (recoveryEoa == address(0)) {
