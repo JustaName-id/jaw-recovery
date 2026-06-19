@@ -195,9 +195,7 @@ contract JustaRecoveryManager is IRecoveryManager, ReentrancyGuard {
             revert JustaRecoveryManager_InvalidApprovalCount(approvals.length, required);
         }
 
-        if (subject.length != 32 && subject.length != 64) {
-            revert JustaRecoveryManager_InvalidSubjectLength(subject.length);
-        }
+        _validateSubject(subject);
 
         uint256 nonce = _recoveryNonce[account];
 
@@ -412,6 +410,25 @@ contract JustaRecoveryManager is IRecoveryManager, ReentrancyGuard {
         returns (bytes32)
     {
         return keccak256(abi.encode(account, provider, commitment));
+    }
+
+    /**
+     * @dev Validate a subject at request time so `executeRecoveryRequest` cannot revert on it after the
+     *      delay. A 32-byte subject must fit in an `address` (clean upper bits) so the execute-time
+     *      `abi.decode(subject, (address))` succeeds; mirrors `MultiOwnable._initializeOwners`. A 64-byte
+     *      subject needs no content check — any `(x, y)` decodes and registers without reverting.
+     */
+    function _validateSubject(bytes calldata subject) internal pure {
+        if (subject.length == 64) {
+            return;
+        }
+        if (subject.length == 32) {
+            if (uint256(abi.decode(subject, (bytes32))) > type(uint160).max) {
+                revert JustaRecoveryManager_InvalidSubject(subject);
+            }
+            return;
+        }
+        revert JustaRecoveryManager_InvalidSubjectLength(subject.length);
     }
 
 }

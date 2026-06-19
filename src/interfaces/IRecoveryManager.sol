@@ -101,6 +101,14 @@ interface IRecoveryManager {
     error JustaRecoveryManager_InvalidSubjectLength(uint256 length);
 
     /**
+     * @notice Thrown when a 32-byte `subject` does not fit in an `address` (dirty upper bits). Validated
+     *         at request so `executeRecoveryRequest`'s `abi.decode(subject, (address))` cannot revert
+     *         after the delay has elapsed.
+     * @param subject The offending subject.
+     */
+    error JustaRecoveryManager_InvalidSubject(bytes subject);
+
+    /**
      * @notice Thrown when a request id does not correspond to a pending recovery request.
      * @param requestId The recovery request id.
      */
