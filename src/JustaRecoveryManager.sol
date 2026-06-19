@@ -7,8 +7,8 @@ import { MultiOwnable } from "justanaccount/MultiOwnable.sol";
 
 import { ReentrancyGuard } from "solady/utils/ReentrancyGuard.sol";
 
-import { IJustaRecoveryProvider } from "./interfaces/IJustaRecoveryProvider.sol";
 import { IRecoveryManager } from "./interfaces/IRecoveryManager.sol";
+import { IRecoveryProvider } from "./interfaces/IRecoveryProvider.sol";
 
 /**
  * @title JustaRecoveryManager
@@ -19,7 +19,7 @@ import { IRecoveryManager } from "./interfaces/IRecoveryManager.sol";
  * or EOA) on the target account.
  *
  * @dev The unit of recovery is a "recovery": a `(provider, commitment)` pair plus a time-lock `delay`,
- *      keyed by `recoveryId = keccak256(abi.encode(provider, commitment))`. The same provider may back
+ *      keyed by `recoveryId = keccak256(abi.encode(account, provider, commitment))`. The same provider may back
  *      several recoveries for one account. The manager owns all state — recoveries & commitments, the
  *      approval threshold, the per-recovery delays, and the per-account replay nonce — and treats
  *      providers as stateless verifiers: on each approval it calls
@@ -34,28 +34,11 @@ contract JustaRecoveryManager is IRecoveryManager, ReentrancyGuard {
     using EnumerableSet for EnumerableSet.Bytes32Set;
 
     ////////////////////////////////////////////////////////////////////////
-    // STRUCTS
-    ////////////////////////////////////////////////////////////////////////
-
-    /**
-     * @notice A queued recovery request awaiting execution.
-     * @dev `account == address(0)` is the sentinel for "not present." It can never collide with a real
-     *      request: a request is only written for an account that registered a recovery, and registration
-     *      requires `msg.sender == account`, so `address(0)` can never be the subject of a request.
-     *      `account` (20 bytes) and `executeAt` (8 bytes) share one storage slot.
-     */
-    struct RecoveryRequest {
-        address account;
-        uint64 executeAt;
-        bytes subject;
-    }
-
-    ////////////////////////////////////////////////////////////////////////
     // STORAGE
     ////////////////////////////////////////////////////////////////////////
 
     /**
-     * @notice Per-account set of registered recovery ids (`keccak256(abi.encode(provider, commitment))`).
+     * @notice Per-account set of registered recovery ids (`keccak256(abi.encode(account, provider, commitment))`).
      */
     mapping(address account => EnumerableSet.Bytes32Set recoveryIds) internal _recoveryIds;
 
@@ -89,25 +72,6 @@ contract JustaRecoveryManager is IRecoveryManager, ReentrancyGuard {
             revert JustaRecoveryManager_NotAccount(msg.sender, account);
         }
         _;
-    }
-
-    ////////////////////////////////////////////////////////////////////////
-    // INTERNAL HELPERS
-    ////////////////////////////////////////////////////////////////////////
-
-    /**
-     * @dev Effective approval threshold for an account (`0` stored => default `1`).
-     */
-    function _effectiveThreshold(address account) internal view returns (uint256) {
-        uint256 threshold = _recoveryThreshold[account];
-        return threshold == 0 ? 1 : threshold;
-    }
-
-    /**
-     * @dev Deterministic id for a `(provider, commitment)` recovery.
-     */
-    function _computeRecoveryId(address provider, bytes calldata commitment) internal pure returns (bytes32) {
-        return keccak256(abi.encode(provider, commitment));
     }
 
     ////////////////////////////////////////////////////////////////////////
@@ -145,7 +109,7 @@ contract JustaRecoveryManager is IRecoveryManager, ReentrancyGuard {
             revert JustaRecoveryManager_EmptyCommitment();
         }
 
-        recoveryId = _computeRecoveryId(provider, commitment);
+        recoveryId = _computeRecoveryId(account, provider, commitment);
         if (!_recoveryIds[account].add(recoveryId)) {
             revert JustaRecoveryManager_RecoveryAlreadyAdded(account, recoveryId);
         }
@@ -231,8 +195,13 @@ contract JustaRecoveryManager is IRecoveryManager, ReentrancyGuard {
             revert JustaRecoveryManager_InvalidApprovalCount(approvals.length, required);
         }
 
-        if (subject.length != 32 && subject.length != 64) {
-            revert JustaRecoveryManager_InvalidSubjectLength(subject.length);
+        _validateSubject(subject);
+
+        // Fail fast if the new owner is already registered (would revert at execute). Best-effort: the
+        // owner set can change during the delay, so this is not a guarantee. `subject` is already the
+        // canonical owner-bytes MultiOwnable keys by, so this covers both EOA and passkey owners.
+        if (MultiOwnable(account).isOwnerBytes(subject)) {
+            revert JustaRecoveryManager_SubjectAlreadyOwner(subject);
         }
 
         uint256 nonce = _recoveryNonce[account];
@@ -265,7 +234,7 @@ contract JustaRecoveryManager is IRecoveryManager, ReentrancyGuard {
             }
 
             // Delegate verification; the provider reverts on an invalid proof.
-            IJustaRecoveryProvider(recovery.provider)
+            IRecoveryProvider(recovery.provider)
                 .verify(account, subject, nonce, recovery.commitment, approvals[i].proof);
         }
 
@@ -352,10 +321,18 @@ contract JustaRecoveryManager is IRecoveryManager, ReentrancyGuard {
     ////////////////////////////////////////////////////////////////////////
 
     /**
-     * @notice The deterministic id for a `(provider, commitment)` recovery.
+     * @notice The deterministic id for an account's `(provider, commitment)` recovery.
      */
-    function computeRecoveryId(address provider, bytes calldata commitment) external pure returns (bytes32) {
-        return _computeRecoveryId(provider, commitment);
+    function computeRecoveryId(
+        address account,
+        address provider,
+        bytes calldata commitment
+    )
+        external
+        pure
+        returns (bytes32)
+    {
+        return _computeRecoveryId(account, provider, commitment);
     }
 
     /**
@@ -407,19 +384,58 @@ contract JustaRecoveryManager is IRecoveryManager, ReentrancyGuard {
     }
 
     /**
-     * @notice The details of a pending recovery request. Returns zero / empty values if not pending.
+     * @notice The details of a pending recovery request (a zeroed `RecoveryRequest` if not pending).
      * @param requestId The recovery request id.
-     * @return account The smart account being recovered.
-     * @return executeAt The timestamp at which the request becomes executable.
-     * @return subject The new-owner payload.
+     * @return The pending request: `account`, `executeAt`, and the new-owner `subject`.
      */
-    function recoveryRequest(bytes32 requestId)
-        external
-        view
-        returns (address account, uint64 executeAt, bytes memory subject)
+    function recoveryRequest(bytes32 requestId) external view returns (RecoveryRequest memory) {
+        return _recoveryRequests[requestId];
+    }
+
+    ////////////////////////////////////////////////////////////////////////
+    // INTERNAL HELPERS
+    ////////////////////////////////////////////////////////////////////////
+
+    /**
+     * @dev Effective approval threshold for an account (`0` stored => default `1`).
+     */
+    function _effectiveThreshold(address account) internal view returns (uint256) {
+        uint256 threshold = _recoveryThreshold[account];
+        return threshold == 0 ? 1 : threshold;
+    }
+
+    /**
+     * @dev Deterministic id for an account's `(provider, commitment)` recovery.
+     */
+    function _computeRecoveryId(
+        address account,
+        address provider,
+        bytes calldata commitment
+    )
+        internal
+        pure
+        returns (bytes32)
     {
-        RecoveryRequest storage request = _recoveryRequests[requestId];
-        return (request.account, request.executeAt, request.subject);
+        return keccak256(abi.encode(account, provider, commitment));
+    }
+
+    /**
+     * @dev Validate a subject at request time so `executeRecoveryRequest` cannot revert on it after the
+     *      delay. A 32-byte subject must fit in an `address` (clean upper bits) so the execute-time
+     *      `abi.decode(subject, (address))` succeeds; mirrors `MultiOwnable._initializeOwners`. A 64-byte
+     *      subject needs no content check — any `(x, y)` decodes and registers without reverting.
+     */
+    function _validateSubject(bytes calldata subject) internal pure {
+        if (subject.length == 64) {
+            return;
+        }
+        if (subject.length == 32) {
+            if (uint256(abi.decode(subject, (bytes32))) > type(uint160).max) {
+                revert JustaRecoveryManager_InvalidSubject(subject);
+            }
+            return;
+        }
+        revert JustaRecoveryManager_InvalidSubjectLength(subject.length);
     }
 
 }

@@ -5,12 +5,12 @@ import { Strings } from "@openzeppelin/contracts/utils/Strings.sol";
 import { Script, console2 } from "forge-std/Script.sol";
 import { SafeSingletonDeployer } from "safe-singleton-deployer-sol/src/SafeSingletonDeployer.sol";
 
-import { JustaECDSARecoveryProvider } from "../src/providers/JustaECDSARecoveryProvider.sol";
+import { ECDSARecoveryProvider } from "../src/providers/ECDSARecoveryProvider.sol";
 
 /**
- * @notice Deploy the JustaECDSARecoveryProvider contract.
+ * @notice Deploy the ECDSARecoveryProvider contract.
  */
-contract DeployJustaECDSARecoveryProvider is Script {
+contract DeployECDSARecoveryProvider is Script {
 
     /// @dev Set to address(0) until the first deterministic deploy; the assert below is guarded so
     /// the first run succeeds. Update with the real address afterwards to enforce the same address
@@ -20,7 +20,7 @@ contract DeployJustaECDSARecoveryProvider is Script {
     bytes32 constant PROVIDER_SALT = 0x0000000000000000000000000000000000000000000000000000000000000001;
 
     function run() public {
-        console2.log("Deploying JustaECDSARecoveryProvider on chain ID", block.chainid);
+        console2.log("Deploying ECDSARecoveryProvider on chain ID", block.chainid);
 
         if (block.chainid == 31_337) {
             vm.startBroadcast();
@@ -32,22 +32,22 @@ contract DeployJustaECDSARecoveryProvider is Script {
     }
 
     function deploy() internal {
-        JustaECDSARecoveryProvider provider = new JustaECDSARecoveryProvider{ salt: 0 }();
+        ECDSARecoveryProvider provider = new ECDSARecoveryProvider{ salt: 0 }();
 
-        logAddress("JustaECDSARecoveryProvider", address(provider));
+        logAddress("ECDSARecoveryProvider", address(provider));
     }
 
     function deployWithSafeSingleton() internal {
         address provider = SafeSingletonDeployer.broadcastDeploy({
-            creationCode: type(JustaECDSARecoveryProvider).creationCode, args: "", salt: PROVIDER_SALT
+            creationCode: type(ECDSARecoveryProvider).creationCode, args: "", salt: PROVIDER_SALT
         });
 
-        console2.log("Deployed JustaECDSARecoveryProvider:", provider);
+        console2.log("Deployed ECDSARecoveryProvider:", provider);
         if (EXPECTED_PROVIDER != address(0)) {
             assert(provider == EXPECTED_PROVIDER);
         }
 
-        logAddress("JustaECDSARecoveryProvider", provider);
+        logAddress("ECDSARecoveryProvider", provider);
     }
 
     function logAddress(string memory name, address addr) internal pure {

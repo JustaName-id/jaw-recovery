@@ -2,7 +2,7 @@
 pragma solidity 0.8.30;
 
 /**
- * @title IJustaRecoveryProvider
+ * @title IRecoveryProvider
  *
  * @notice Stateless verifier interface for JAW recovery providers. A provider holds NO per-account
  * state: the JustaRecoveryManager owns the registry of recovery commitments and the per-account replay
@@ -21,7 +21,7 @@ pragma solidity 0.8.30;
  *
  * @author JustaLab
  */
-interface IJustaRecoveryProvider {
+interface IRecoveryProvider {
 
     /**
      * @notice Verify that `proof` authorizes recovering `account` to the owner encoded in `subject`,
