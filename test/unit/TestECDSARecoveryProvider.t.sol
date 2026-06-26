@@ -133,6 +133,42 @@ contract TestECDSARecoveryProvider is Test, PrepareRecovery {
         provider.verify(account, subject, nonce + 1, commitment, proof);
     }
 
+    function test_Verify_RevertIfAccountMismatch(
+        address account,
+        address otherAccount,
+        uint256 nonce,
+        bytes calldata subject
+    )
+        public
+    {
+        vm.assume(account != otherAccount);
+
+        bytes memory commitment = encodeEoaCommitment(recoveryEoa);
+        bytes memory proof = signRecoverProof(provider, account, nonce, subject, recoveryEoaPk);
+
+        // A proof bound to `account` must not verify for a different account (cross-account replay safety).
+        vm.expectRevert(ECDSARecoveryProvider.ECDSARecoveryProvider_InvalidSignature.selector);
+        provider.verify(otherAccount, subject, nonce, commitment, proof);
+    }
+
+    function test_Verify_RevertIfSubjectMismatch(
+        address account,
+        uint256 nonce,
+        bytes calldata subject,
+        bytes calldata otherSubject
+    )
+        public
+    {
+        vm.assume(keccak256(subject) != keccak256(otherSubject));
+
+        bytes memory commitment = encodeEoaCommitment(recoveryEoa);
+        bytes memory proof = signRecoverProof(provider, account, nonce, subject, recoveryEoaPk);
+
+        // A proof bound to `subject` must not verify for a different subject (no new-owner substitution).
+        vm.expectRevert(ECDSARecoveryProvider.ECDSARecoveryProvider_InvalidSignature.selector);
+        provider.verify(account, otherSubject, nonce, commitment, proof);
+    }
+
     function test_Verify_RevertIfDomainMismatch(address account, uint256 nonce, bytes calldata subject) public {
         // A second deployment has a different EIP-712 domain (verifyingContract), so a proof signed for
         // `provider` must not verify on `otherProvider`.
@@ -151,4 +187,5 @@ contract TestECDSARecoveryProvider is Test, PrepareRecovery {
 
         provider.verify(account, subject, nonce, commitment, proof);
     }
+
 }

@@ -10,6 +10,7 @@ import { JustaRecoveryManager } from "../../src/JustaRecoveryManager.sol";
 import { IRecoveryManager } from "../../src/interfaces/IRecoveryManager.sol";
 import { IRecoveryProvider } from "../../src/interfaces/IRecoveryProvider.sol";
 
+// TODO: check the way to opt out of recovery when the recovery count is below the threshold
 contract TestManagerWriteFunctions is Test, PrepareRecovery {
 
     JustaRecoveryManager public manager;
@@ -271,26 +272,31 @@ contract TestManagerWriteFunctions is Test, PrepareRecovery {
     function test_RemoveRecovery_ShouldRemoveAndEmit(
         address account,
         address provider,
-        bytes calldata commitment,
-        uint32 delay
+        bytes calldata commitment1,
+        bytes calldata commitment2,
+        uint32 delay1,
+        uint32 delay2
     )
         public
     {
-        vm.assume(commitment.length != 0);
+        vm.assume(commitment1.length != 0 && commitment2.length != 0);
+        vm.assume(keccak256(commitment1) != keccak256(commitment2));
 
-        bytes32 recoveryId = _addRecovery(account, provider, commitment, delay);
+        // Two recoveries under the default threshold of 1: removing one leaves the other (count 1 >= 1).
+        bytes32 recoveryId1 = _addRecovery(account, provider, commitment1, delay1);
+        bytes32 recoveryId2 = _addRecovery(account, provider, commitment2, delay2);
 
         vm.expectEmit(true, true, false, false, address(manager));
-        emit IRecoveryManager.RecoveryRemoved(account, recoveryId);
+        emit IRecoveryManager.RecoveryRemoved(account, recoveryId1);
 
         vm.prank(account);
-        manager.removeRecovery(account, recoveryId);
+        manager.removeRecovery(account, recoveryId1);
 
-        assertFalse(manager.hasRecovery(account, recoveryId));
-        assertEq(manager.recoveryCount(account), 0);
-
-        IRecoveryManager.Recovery memory recovery = manager.getRecovery(account, recoveryId);
-        assertEq(recovery.provider, address(0));
+        // The removed recovery is gone; the other survives.
+        assertFalse(manager.hasRecovery(account, recoveryId1));
+        assertEq(manager.getRecovery(account, recoveryId1).provider, address(0));
+        assertTrue(manager.hasRecovery(account, recoveryId2));
+        assertEq(manager.recoveryCount(account), 1);
     }
 
     function test_RemoveRecovery_ShouldAllowFullOptOut(
