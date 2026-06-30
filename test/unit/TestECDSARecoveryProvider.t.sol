@@ -89,7 +89,7 @@ contract TestECDSARecoveryProvider is Test, PrepareRecovery {
         provider.verify(account, subject, nonce, commitment, proof);
     }
 
-    function test_Verify_RevertIfProofLengthNot65(
+    function test_Verify_RevertIfMalformedProof(
         address account,
         bytes calldata subject,
         uint256 nonce,
@@ -98,16 +98,16 @@ contract TestECDSARecoveryProvider is Test, PrepareRecovery {
     )
         public
     {
-        vm.assume(proof.length != 65);
+        // A proof whose length is not a valid ECDSA signature (64 or 65 bytes) cannot be a valid signature
+        // for an EOA signer, so `SignatureCheckerLib` returns false and `verify` reverts with the generic
+        // InvalidSignature — the dedicated InvalidProofLength error was removed along with the length check.
+        vm.assume(proof.length != 64 && proof.length != 65);
         vm.assume(commitmentEoa != address(0));
+        vm.assume(commitmentEoa.code.length == 0);
 
         bytes memory commitment = encodeEoaCommitment(commitmentEoa);
 
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                ECDSARecoveryProvider.ECDSARecoveryProvider_InvalidProofLength.selector, proof.length
-            )
-        );
+        vm.expectRevert(ECDSARecoveryProvider.ECDSARecoveryProvider_InvalidSignature.selector);
         provider.verify(account, subject, nonce, commitment, proof);
     }
 
@@ -185,6 +185,16 @@ contract TestECDSARecoveryProvider is Test, PrepareRecovery {
         bytes memory commitment = encodeEoaCommitment(recoveryEoa);
         bytes memory proof = signRecoverProof(provider, account, nonce, subject, recoveryEoaPk);
 
+        provider.verify(account, subject, nonce, commitment, proof);
+    }
+
+    function test_Verify_ShouldAcceptCompactSignature(address account, uint256 nonce, bytes calldata subject) public {
+        // `SignatureCheckerLib` accepts the 64-byte EIP-2098 short form for EOA signers, so a compact proof
+        // from the committed EOA verifies just like the 65-byte `(r, s, v)` form.
+        bytes memory commitment = encodeEoaCommitment(recoveryEoa);
+        bytes memory proof = signRecoverProofCompact(provider, account, nonce, subject, recoveryEoaPk);
+
+        assertEq(proof.length, 64);
         provider.verify(account, subject, nonce, commitment, proof);
     }
 

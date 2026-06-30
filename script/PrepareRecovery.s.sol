@@ -96,4 +96,29 @@ contract PrepareRecovery is Script, CodeConstants {
         return abi.encodePacked(r, s, v);
     }
 
+    /**
+     * @notice Produces a 64-byte EIP-2098 compact ECDSA recovery proof signed by `privateKey` over the
+     *         provider's canonical EIP-712 digest for `(account, nonce, subject)`.
+     * @dev Mirrors `signRecoverProof` but returns the EIP-2098 short form `(r, vs)` that `SignatureCheckerLib`
+     *      also accepts for EOA signers. `vm.sign` yields canonical low-s, so the top bit of `s` is free to
+     *      carry the y-parity (`v - 27`).
+     * @return proof The 64-byte `(r, vs)` compact signature.
+     */
+    function signRecoverProofCompact(
+        ECDSARecoveryProvider provider,
+        address account,
+        uint256 nonce,
+        bytes memory subject,
+        uint256 privateKey
+    )
+        public
+        view
+        returns (bytes memory proof)
+    {
+        bytes32 digest = provider.recoverDigest(account, nonce, subject);
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(privateKey, digest);
+        bytes32 vs = bytes32(uint256(s) | (uint256(v - 27) << 255));
+        return abi.encodePacked(r, vs);
+    }
+
 }
