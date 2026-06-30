@@ -78,12 +78,7 @@ contract TestRecoveryCommitmentCanonicalityFlow is Test, PrepareRecovery {
      *      is satisfied — sets threshold 2, and submits one valid signature for both slots. The provider
      *      rejects the non-canonical commitment before the signature is even checked, so nothing is queued.
      */
-    function test_ShouldRejectThresholdBypassViaNonCanonicalCommitment(
-        address newOwner,
-        uint256 recoveryEoaPk
-    )
-        public
-    {
+    function test_ShouldRejectThresholdBypassViaNonCanonicalCommitment(address newOwner, uint256 recoveryEoaPk) public {
         vm.assume(newOwner != address(0) && newOwner != account && newOwner != address(manager));
         recoveryEoaPk = bound(recoveryEoaPk, 1, SECP256K1_CURVE_ORDER - 1);
         address recoveryEoa = vm.addr(recoveryEoaPk);
