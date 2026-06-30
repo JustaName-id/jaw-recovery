@@ -13,9 +13,22 @@ contract TestECDSARecoveryProvider is Test, PrepareRecovery {
     address public recoveryEoa;
     uint256 public recoveryEoaPk;
 
+    /// @dev ERC-1271 magic value, equal to the `isValidSignature(bytes32,bytes)` selector.
+    bytes4 internal constant ERC1271_MAGIC_VALUE = 0x1626ba7e;
+
     function setUp() public {
         provider = new ECDSARecoveryProvider();
         (recoveryEoa, recoveryEoaPk) = makeAddrAndKey("recoveryEoa");
+    }
+
+    /// @dev Etches `signer` with code so `SignatureCheckerLib` takes the ERC-1271 contract-signer branch,
+    ///      then mocks its `isValidSignature` to return `magic`. Excludes the zero address, precompiles, and
+    ///      the addresses the test relies on so a fuzzer landing on one is discarded.
+    function _stubContractSigner(address signer, bytes4 magic) private {
+        vm.assume(uint160(signer) > 0xff);
+        vm.assume(signer != address(provider) && signer != address(this) && signer != address(vm));
+        vm.etch(signer, hex"00");
+        vm.mockCall(signer, abi.encodeWithSelector(ERC1271_MAGIC_VALUE), abi.encode(magic));
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -196,6 +209,46 @@ contract TestECDSARecoveryProvider is Test, PrepareRecovery {
 
         assertEq(proof.length, 64);
         provider.verify(account, subject, nonce, commitment, proof);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                      verify() ERC-1271 SIGNER TESTS
+    //////////////////////////////////////////////////////////////*/
+
+    function test_Verify_ShouldAcceptContractSigner(
+        address account,
+        uint256 nonce,
+        bytes calldata subject,
+        address signer,
+        bytes calldata proof
+    )
+        public
+    {
+        // A committed contract signer whose ERC-1271 `isValidSignature` returns the magic value: the
+        // `SignatureCheckerLib` contract-signer path accepts, so `verify` passes. The proof bytes are opaque
+        // to this path — a real guardian validates them internally.
+        _stubContractSigner(signer, ERC1271_MAGIC_VALUE);
+
+        provider.verify(account, subject, nonce, encodeEoaCommitment(signer), proof);
+    }
+
+    function test_Verify_RevertIfContractSignerRejects(
+        address account,
+        uint256 nonce,
+        bytes calldata subject,
+        address signer,
+        bytes4 magic,
+        bytes calldata proof
+    )
+        public
+    {
+        // A committed contract signer whose ERC-1271 `isValidSignature` returns anything but the magic value:
+        // the contract-signer path returns false, so `verify` reverts with the provider's InvalidSignature.
+        vm.assume(magic != ERC1271_MAGIC_VALUE);
+        _stubContractSigner(signer, magic);
+
+        vm.expectRevert(ECDSARecoveryProvider.ECDSARecoveryProvider_InvalidSignature.selector);
+        provider.verify(account, subject, nonce, encodeEoaCommitment(signer), proof);
     }
 
 }

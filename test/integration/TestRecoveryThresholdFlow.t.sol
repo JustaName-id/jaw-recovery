@@ -77,6 +77,8 @@ contract TestRecoveryThresholdFlow is Test, PrepareRecovery {
         address eoaC = vm.addr(pkC);
         // Distinct commitments are required: same EOA -> same recoveryId -> RecoveryAlreadyAdded.
         vm.assume(eoaA != eoaB && eoaA != eoaC && eoaB != eoaC);
+        // Committed signers must be code-free EOAs (else SignatureCheckerLib takes the ERC-1271 path).
+        vm.assume(eoaA.code.length == 0 && eoaB.code.length == 0 && eoaC.code.length == 0);
 
         bytes32 idA = _addEcdsaRecovery(eoaA, 0);
         bytes32 idB = _addEcdsaRecovery(eoaB, 0);
@@ -122,6 +124,8 @@ contract TestRecoveryThresholdFlow is Test, PrepareRecovery {
         address eoaA = vm.addr(pkA);
         address eoaB = vm.addr(pkB);
         vm.assume(eoaA != eoaB);
+        // Committed signers must be code-free EOAs (else SignatureCheckerLib takes the ERC-1271 path).
+        vm.assume(eoaA.code.length == 0 && eoaB.code.length == 0);
 
         // Order the delays so B is strictly larger; B must govern `executeAt`.
         delayB = uint32(bound(delayB, 1, type(uint32).max));
@@ -186,6 +190,8 @@ contract TestRecoveryThresholdFlow is Test, PrepareRecovery {
         vm.assume(eoaA != eoaB);
         // The forged proof must genuinely fail B's commitment: a wrong signer, not eoaB.
         vm.assume(vm.addr(pkWrong) != eoaB);
+        // Committed signers must be code-free EOAs (else SignatureCheckerLib takes the ERC-1271 path).
+        vm.assume(eoaA.code.length == 0 && eoaB.code.length == 0);
 
         bytes32 idA = _addEcdsaRecovery(eoaA, 0);
         bytes32 idB = _addEcdsaRecovery(eoaB, 0);

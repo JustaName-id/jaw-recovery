@@ -654,6 +654,52 @@ contract TestManagerWriteFunctions is Test, PrepareRecovery {
         assertEq(request.subject.length, 64);
     }
 
+    function test_RequestRecovery_ShouldSupportMultipleSimultaneousRequests(
+        address account,
+        address provider,
+        address ownerA,
+        address ownerB,
+        uint32 delay
+    )
+        public
+    {
+        vm.assume(ownerA != ownerB);
+
+        // A single registered recovery backs both requests; the account is a non-owner and verify accepts.
+        bytes32 recoveryId = _addRecovery(account, provider, hex"01", delay);
+        _stubAccount(account, false);
+        _acceptVerify(provider);
+
+        IRecoveryManager.Approval[] memory approvals = new IRecoveryManager.Approval[](1);
+        approvals[0] = createApproval(recoveryId, "");
+
+        bytes memory subjectA = encodeEoaSubject(ownerA);
+        bytes memory subjectB = encodeEoaSubject(ownerB);
+
+        // Queue request A over nonce 0, then request B over the bumped nonce 1: both coexist under distinct
+        // ids (requestId binds the nonce, which advances between them).
+        bytes32 requestIdA = manager.requestRecovery(account, subjectA, approvals);
+        bytes32 requestIdB = manager.requestRecovery(account, subjectB, approvals);
+
+        assertTrue(requestIdA != requestIdB);
+        assertEq(manager.recoveryRequest(requestIdA).subject, subjectA);
+        assertEq(manager.recoveryRequest(requestIdB).subject, subjectB);
+        assertEq(manager.recoveryNonce(account), 2);
+
+        // Execute A: only request A is consumed; request B stays pending and independently executable.
+        vm.warp(manager.recoveryRequest(requestIdA).executeAt);
+        vm.mockCall(account, abi.encodeWithSelector(MultiOwnable.addOwnerAddress.selector), "");
+        vm.expectCall(account, abi.encodeCall(MultiOwnable.addOwnerAddress, (ownerA)));
+        manager.executeRecoveryRequest(requestIdA);
+        assertEq(manager.recoveryRequest(requestIdA).account, address(0));
+        assertEq(manager.recoveryRequest(requestIdB).account, account);
+
+        // Cancel B: consumed independently, with request A already gone.
+        vm.prank(account);
+        manager.cancelRecoveryRequest(requestIdB);
+        assertEq(manager.recoveryRequest(requestIdB).account, address(0));
+    }
+
     /*//////////////////////////////////////////////////////////////
                       executeRecoveryRequest() TESTS
     //////////////////////////////////////////////////////////////*/

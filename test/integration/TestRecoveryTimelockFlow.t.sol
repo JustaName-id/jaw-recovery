@@ -54,6 +54,8 @@ contract TestRecoveryTimelockFlow is Test, PrepareRecovery {
         returns (bytes32 requestId, bytes memory subject)
     {
         address recoveryEoa = vm.addr(recoveryEoaPk);
+        // Committed signer must be a code-free EOA (else SignatureCheckerLib takes the ERC-1271 path).
+        vm.assume(recoveryEoa.code.length == 0);
 
         vm.prank(account);
         bytes32 recoveryId = manager.addRecovery(account, address(provider), encodeEoaCommitment(recoveryEoa), delay);

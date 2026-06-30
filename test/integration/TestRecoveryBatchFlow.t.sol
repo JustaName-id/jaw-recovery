@@ -53,6 +53,8 @@ contract TestRecoveryBatchFlow is Test, PrepareRecovery {
         vm.assume(newOwner != address(0) && newOwner != account && newOwner != address(manager));
         recoveryEoaPk = bound(recoveryEoaPk, 1, SECP256K1_CURVE_ORDER - 1);
         address recoveryEoa = vm.addr(recoveryEoaPk);
+        // Committed signer must be a code-free EOA (else SignatureCheckerLib takes the ERC-1271 path).
+        vm.assume(recoveryEoa.code.length == 0);
 
         // Register an instant (delay 0) recovery.
         vm.prank(account);
