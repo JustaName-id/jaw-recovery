@@ -10,7 +10,6 @@ import { JustaRecoveryManager } from "../../src/JustaRecoveryManager.sol";
 import { IRecoveryManager } from "../../src/interfaces/IRecoveryManager.sol";
 import { IRecoveryProvider } from "../../src/interfaces/IRecoveryProvider.sol";
 
-// TODO: check the way to opt out of recovery when the recovery count is below the threshold
 contract TestManagerWriteFunctions is Test, PrepareRecovery {
 
     JustaRecoveryManager public manager;

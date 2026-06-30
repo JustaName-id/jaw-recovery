@@ -8,8 +8,6 @@ import { JustaRecoveryManager } from "../../src/JustaRecoveryManager.sol";
 import { IRecoveryManager } from "../../src/interfaces/IRecoveryManager.sol";
 import { ECDSARecoveryProvider } from "../../src/providers/ECDSARecoveryProvider.sol";
 
-// TODO: Test nonce incrementation with requestRecovery
-// TODO: Test recoveryRequest return value
 contract TestManagerReadFunctions is Test, PrepareRecovery {
 
     JustaRecoveryManager public manager;
