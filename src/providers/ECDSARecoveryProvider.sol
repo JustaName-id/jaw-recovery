@@ -11,9 +11,10 @@ import { IRecoveryProvider } from "../interfaces/IRecoveryProvider.sol";
  *
  * @notice Stateless signature-based recovery verifier for JAW accounts. The recovery commitment is a
  * signer address; the recovery proof is an EIP-712 signature over `(account, nonce, subject)`, validated
- * with Solady's `SignatureCheckerLib`: a raw ECDSA signature when the signer is an EOA, or an ERC-1271
- * `isValidSignature` check when the signer is a contract (e.g. a smart-account / passkey-backed guardian).
- * A single path therefore covers both EOA and smart-account guardians.
+ * with Solady's `SignatureCheckerLib.isValidERC6492SignatureNow`: a raw ECDSA signature when the signer is
+ * an EOA, an ERC-1271 `isValidSignature` check when the signer is a deployed contract (e.g. a smart-account
+ * / passkey-backed guardian), or an ERC-6492 wrapper when the signer is a counterfactual (not-yet-deployed)
+ * contract. A single path therefore covers EOA, smart-account, and undeployed smart-account guardians.
  *
  * @dev Holds no per-account state. The JustaRecoveryManager owns the commitment registry and the
  *      per-account replay nonce and passes them in on each `verify` call, so a single deployment of this
@@ -84,9 +85,10 @@ contract ECDSARecoveryProvider is IRecoveryProvider, EIP712 {
         }
 
         // Verify the proof against the committed signer over the canonical EIP-712 digest. SignatureCheckerLib
-        // validates a raw ECDSA signature when `signer` is an EOA and falls back to an ERC-1271
-        // `isValidSignature` call when `signer` is a contract, so one path covers EOA and smart-account guardians.
-        if (!SignatureCheckerLib.isValidSignatureNowCalldata(signer, _recoverDigest(account, nonce, subject), proof)) {
+        // validates a raw ECDSA signature when `signer` is an EOA, an ERC-1271 `isValidSignature` call when
+        // `signer` is a deployed contract, and an ERC-6492 wrapper when `signer` is a counterfactual
+        // (not-yet-deployed) contract — one path covering EOA, smart-account, and undeployed guardians.
+        if (!SignatureCheckerLib.isValidERC6492SignatureNow(signer, _recoverDigest(account, nonce, subject), proof)) {
             revert ECDSARecoveryProvider_InvalidSignature();
         }
     }
