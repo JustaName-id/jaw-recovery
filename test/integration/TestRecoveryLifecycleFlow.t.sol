@@ -39,6 +39,12 @@ contract TestRecoveryLifecycleFlow is Test, PrepareRecovery {
     /// @dev The guardian's passkey private key
     uint256 public constant GUARDIAN_PASSKEY_PK = 0x03d99692017473e2d631945a812607b23269d85721e0f370b8d3e7d29a874fd2;
 
+    /// @dev A fresh factory nonce for the counterfactual (undeployed) guardian in the ERC-6492 test.
+    uint256 internal constant GUARDIAN_CF_NONCE = 1;
+
+    /// @dev The ERC-6492 magic suffix that marks a wrapped (predeploy) signature.
+    bytes32 internal constant ERC6492_MAGIC = 0x6492649264926492649264926492649264926492649264926492649264926492;
+
     function setUp() public {
         entryPoint = new EntryPoint();
         manager = new JustaRecoveryManager();
@@ -210,6 +216,59 @@ contract TestRecoveryLifecycleFlow is Test, PrepareRecovery {
     }
 
     /**
+     * @notice Recovers an account using a COUNTERFACTUAL (not-yet-deployed) passkey-backed smart-account
+     *         guardian, exercising the provider's ERC-6492 path.
+     * @dev The guardian address is predicted but never deployed. The proof is an ERC-6492 wrapper
+     *      (create2 factory + `createAccount` calldata + inner WebAuthn signature). Solady's reverting
+     *      verifier deploys the guardian in a reverted context to run its ERC-1271 check, so the guardian
+     *      is validated without ending up persistently deployed.
+     */
+    function test_ShouldRecoverWithUndeployedPasskeyGuardianEndToEnd(address newOwner, uint32 delay) public {
+        address payable account = TEST_ACCOUNT_ADDRESS;
+
+        vm.assume(newOwner != address(0));
+        vm.assume(newOwner != account);
+        vm.assume(newOwner != address(manager));
+
+        // Etch Solady's canonical ERC-6492 reverting verifier so the undeployed-signer path resolves.
+        _etchErc6492RevertingVerifier();
+
+        // A counterfactual passkey guardian: address predicted from a fresh nonce, deliberately NOT deployed.
+        (uint256 gx, uint256 gy) = vm.publicKeyP256(GUARDIAN_PASSKEY_PK);
+        bytes[] memory guardianOwners = new bytes[](1);
+        guardianOwners[0] = abi.encode(bytes32(gx), bytes32(gy));
+        address undeployedGuardian = factory.getAddress(guardianOwners, GUARDIAN_CF_NONCE);
+        assertEq(undeployedGuardian.code.length, 0);
+
+        vm.prank(account);
+        bytes32 recoveryId =
+            manager.addRecovery(account, address(provider), encodeEoaCommitment(undeployedGuardian), delay);
+
+        bytes memory subject = encodeEoaSubject(newOwner);
+        uint256 nonce = manager.recoveryNonce(account);
+
+        // ERC-6492 wrapper: abi.encode(create2Factory, factoryCalldata, innerSig) ++ magic. The inner proof is
+        // a WebAuthn signature over the guardian's *predicted* EIP-712 domain (it isn't deployed to query).
+        bytes memory innerProof = _webAuthnProof(_guardian7739Hash(undeployedGuardian, account, nonce, subject));
+        bytes memory factoryCalldata =
+            abi.encodeCall(JustanAccountFactory.createAccount, (guardianOwners, GUARDIAN_CF_NONCE));
+        bytes memory proof = abi.encodePacked(abi.encode(address(factory), factoryCalldata, innerProof), ERC6492_MAGIC);
+
+        IRecoveryManager.Approval[] memory approvals = new IRecoveryManager.Approval[](1);
+        approvals[0] = createApproval(recoveryId, proof);
+
+        bytes32 requestId = manager.requestRecovery(account, subject, approvals);
+        vm.warp(manager.recoveryRequest(requestId).executeAt);
+        manager.executeRecoveryRequest(requestId);
+
+        // The new EOA is a real owner, and the guardian was validated WITHOUT being persistently deployed.
+        assertTrue(JustanAccount(account).isOwnerAddress(newOwner));
+        assertEq(JustanAccount(account).ownerCount(), 2);
+        assertEq(manager.recoveryNonce(account), nonce + 1);
+        assertEq(undeployedGuardian.code.length, 0);
+    }
+
+    /**
      * @dev Builds the guardian's ERC-1271 proof: a WebAuthn signature from the guardian's passkey over the
      *      provider's `(account, nonce, subject)` digest, wrapped in ERC-7739 (PersonalSign) using the
      *      guardian account's own EIP-712 domain — the form the guardian re-derives in `isValidSignature`.
@@ -223,11 +282,39 @@ contract TestRecoveryLifecycleFlow is Test, PrepareRecovery {
         view
         returns (bytes memory)
     {
+        return _webAuthnProof(_guardian7739Hash(address(guardian), account, nonce, subject));
+    }
+
+    /**
+     * @dev The ERC-7739 (PersonalSign) hash a JustanAccount `signer` validates in `isValidSignature`, built
+     *      from the signer's *predicted* EIP-712 domain (name/version/chainId/address). Computing the domain
+     *      from the address rather than querying `eip712Domain()` lets it work for a not-yet-deployed guardian.
+     */
+    function _guardian7739Hash(
+        address signer,
+        address account,
+        uint256 nonce,
+        bytes memory subject
+    )
+        internal
+        view
+        returns (bytes32)
+    {
         bytes32 digest = provider.recoverDigest(account, nonce, subject);
 
-        ERC7739Utils.DomainData memory domainData = ERC7739Utils.getDomainDataFromAccount(address(guardian));
-        bytes32 erc7739Hash = ERC7739Utils.erc7739HashFromPersonalSignHash(digest, domainData);
+        ERC7739Utils.DomainData memory domainData;
+        domainData.name = "JustanAccount";
+        domainData.version = "1";
+        domainData.chainId = block.chainid;
+        domainData.verifyingContract = signer;
+        domainData.domainSeparator = ERC7739Utils.computeDomainSeparator(domainData);
 
+        return ERC7739Utils.erc7739HashFromPersonalSignHash(digest, domainData);
+    }
+
+    /// @dev Wraps `erc7739Hash` in a WebAuthn assertion signed by the guardian's passkey, ABI-encoded as a
+    ///      JustanAccount `SignatureWrapper` at owner index 0.
+    function _webAuthnProof(bytes32 erc7739Hash) internal pure returns (bytes memory) {
         bytes memory authenticatorData = hex"49960de5880e8c687434170f6476605b8fe4aeb9a28632c7995cf3ba831d97630500000000";
         string memory clientDataJSON = string(
             abi.encodePacked(
@@ -262,6 +349,19 @@ contract TestRecoveryLifecycleFlow is Test, PrepareRecovery {
     function _normalizeP256S(uint256 s) private pure returns (uint256) {
         uint256 n = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551;
         return s > n / 2 ? n - s : s;
+    }
+
+    /// @dev Deploys Solady's canonical reverting ERC-6492 verifier (initcode taken from Solady's own tests)
+    ///      at the hardcoded address `SignatureCheckerLib` calls, so the undeployed-signer path resolves.
+    function _etchErc6492RevertingVerifier() internal {
+        bytes memory initcode =
+            hex"6040600b3d3960403df3fe36383d373d3d6020515160208051013d3d515af160203851516084018038385101606037303452813582523838523490601c34355afa34513060e01b141634fd";
+        address deployed;
+        assembly {
+            deployed := create(0, add(initcode, 0x20), mload(initcode))
+        }
+        require(deployed != address(0), "verifier deploy failed");
+        vm.etch(0x00007bd799e4A591FeA53f8A8a3E9f931626Ba7e, deployed.code);
     }
 
 }
