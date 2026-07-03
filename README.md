@@ -1,5 +1,7 @@
 # JustaRecoveryManager
 
+> **🚧 Active development — not audited, not deployed.** This module is under active design and review. Interfaces, storage layout, and behavior may change without notice. Do not deploy to production or integrate against it until it has completed a security audit and a versioned release is tagged.
+
 ## Overview
 
 `JustaRecoveryManager` is a Solidity smart contract that provides M-of-N, time-locked account recovery for [JustanAccount](https://github.com/justaname-id/justanaccount) smart accounts. An account opts in by registering the manager as one of its owners; if its keys are later lost, a pre-configured set of recovery factors can — after a per-factor time-lock — register a new owner (a WebAuthn passkey or an EOA) on the account.
