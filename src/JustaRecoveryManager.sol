@@ -80,9 +80,10 @@ contract JustaRecoveryManager is IRecoveryManager, ReentrancyGuard {
 
     /**
      * @notice Register a recovery for an account.
-     * @dev Callable only by the account. The same `provider` may be registered with different
-     *      `commitment`s. Reverts if the `(provider, commitment)` recovery already exists. To change a
-     *      recovery's `delay`, remove it and add it again.
+     * @dev Callable only by the account. The account must have opted in by registering this manager as an
+     *      owner (`addOwnerAddress(address(this))`) before recoveries can be added. The same `provider` may
+     *      be registered with different `commitment`s. Reverts if the `(provider, commitment)` recovery
+     *      already exists. To change a recovery's `delay`, remove it and add it again.
      * @param account The smart account.
      * @param provider The recovery provider (a stateless verifier); must be a contract.
      * @param commitment Provider-specific commitment bytes (e.g. `abi.encode(eoa)`, an email hash).
@@ -108,6 +109,9 @@ contract JustaRecoveryManager is IRecoveryManager, ReentrancyGuard {
         if (commitment.length == 0) {
             revert JustaRecoveryManager_EmptyCommitment();
         }
+        if (!MultiOwnable(account).isOwnerAddress(address(this))) {
+            revert JustaRecoveryManager_ManagerNotAccountOwner(account);
+        }
 
         recoveryId = _computeRecoveryId(account, provider, commitment);
         if (!_recoveryIds[account].add(recoveryId)) {
@@ -122,7 +126,9 @@ contract JustaRecoveryManager is IRecoveryManager, ReentrancyGuard {
     /**
      * @notice Unregister a recovery for an account.
      * @dev Callable only by the account. Rejected if it would drop the recovery count below the threshold,
-     *      unless it removes the last recovery (a full opt-out to zero).
+     *      unless it removes the last recovery (a full opt-out to zero). Intentionally callable without the
+     *      manager being an owner of `account`, so an account that opted out (or was never fully opted in)
+     *      can still clean up its stale registrations.
      * @param account The smart account.
      * @param recoveryId The recovery id to remove.
      */
@@ -148,7 +154,9 @@ contract JustaRecoveryManager is IRecoveryManager, ReentrancyGuard {
     /**
      * @notice Set the per-account approval threshold.
      * @dev Callable only by the account. Must be within `[1, recoveryCount]` so a recovery is always
-     *      achievable.
+     *      achievable. Intentionally callable without the manager being an owner of `account`: `removeRecovery`
+     *      refuses to drop the count below the threshold, so lowering the threshold must stay possible even
+     *      for an account that opted out, or its stale recoveries could never be cleaned up.
      * @param account The smart account.
      * @param threshold The number of distinct recoveries required to approve a request.
      */
@@ -202,6 +210,13 @@ contract JustaRecoveryManager is IRecoveryManager, ReentrancyGuard {
         // canonical owner-bytes MultiOwnable keys by, so this covers both EOA and passkey owners.
         if (MultiOwnable(account).isOwnerBytes(subject)) {
             revert JustaRecoveryManager_SubjectAlreadyOwner(subject);
+        }
+
+        // Fail fast if the manager was removed as an owner after setup, so guardians do not burn
+        // single-use proofs on a request that can never execute. Best-effort: the owner set can still
+        // change during the delay.
+        if (!MultiOwnable(account).isOwnerAddress(address(this))) {
+            revert JustaRecoveryManager_ManagerNotAccountOwner(account);
         }
 
         uint256 nonce = _recoveryNonce[account];
