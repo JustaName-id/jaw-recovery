@@ -47,6 +47,14 @@ interface IRecoveryManager {
     error JustaRecoveryManager_EmptyCommitment();
 
     /**
+     * @notice Thrown when the recovery manager is not registered as an owner of `account`: either the
+     *         account never opted in (never called `addOwnerAddress(address(manager))`), or it was later
+     *         removed as an owner.
+     * @param account The smart account.
+     */
+    error JustaRecoveryManager_ManagerNotAccountOwner(address account);
+
+    /**
      * @notice Thrown when adding a recovery that is already registered for the account.
      * @param account The smart account.
      * @param recoveryId The recovery id (`keccak256(abi.encode(account, provider, commitment))`).

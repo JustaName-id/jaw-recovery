@@ -269,6 +269,39 @@ contract TestRecoveryLifecycleFlow is Test, PrepareRecovery {
     }
 
     /**
+     * @notice A fresh account that never opted in cannot register a recovery; after it registers the
+     *         manager as an owner, the identical call succeeds.
+     * @dev Unlike every other test here, this deploys a separate JustanAccount via the factory rather than
+     *      using `TEST_ACCOUNT_ADDRESS` (already opted in during `setUp`), since it needs an account that has
+     *      never registered the manager as an owner.
+     */
+    function test_AddRecovery_RevertIfManagerNotAccountOwner(address freshOwner) public {
+        vm.assume(freshOwner != address(0));
+
+        bytes[] memory freshOwners = new bytes[](1);
+        freshOwners[0] = abi.encode(freshOwner);
+        JustanAccount freshAccount = factory.createAccount(freshOwners, 0);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IRecoveryManager.JustaRecoveryManager_ManagerNotAccountOwner.selector, address(freshAccount)
+            )
+        );
+        vm.prank(address(freshAccount));
+        manager.addRecovery(address(freshAccount), address(provider), encodeEoaCommitment(freshOwner), 0);
+
+        // Opt in, then the identical call succeeds.
+        vm.prank(address(freshAccount));
+        freshAccount.addOwnerAddress(address(manager));
+
+        vm.prank(address(freshAccount));
+        bytes32 recoveryId =
+            manager.addRecovery(address(freshAccount), address(provider), encodeEoaCommitment(freshOwner), 0);
+
+        assertTrue(manager.hasRecovery(address(freshAccount), recoveryId));
+    }
+
+    /**
      * @dev Builds the guardian's ERC-1271 proof: a WebAuthn signature from the guardian's passkey over the
      *      provider's `(account, nonce, subject)` digest, wrapped in ERC-7739 (PersonalSign) using the
      *      guardian account's own EIP-712 domain — the form the guardian re-derives in `isValidSignature`.

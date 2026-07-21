@@ -3,6 +3,8 @@ pragma solidity 0.8.30;
 
 import { Test } from "forge-std/Test.sol";
 
+import { MultiOwnable } from "justanaccount/MultiOwnable.sol";
+
 import { PrepareRecovery } from "../../script/PrepareRecovery.s.sol";
 import { JustaRecoveryManager } from "../../src/JustaRecoveryManager.sol";
 import { IRecoveryManager } from "../../src/interfaces/IRecoveryManager.sol";
@@ -18,8 +20,20 @@ contract TestManagerReadFunctions is Test, PrepareRecovery {
         provider = new ECDSARecoveryProvider();
     }
 
+    /// @dev Etches `account` (so the `isOwnerAddress` call's extcodesize check passes) and stubs it to
+    ///      report the manager as a registered owner, satisfying `addRecovery`'s opt-in check.
+    function _stubManagerOwner(address account) private {
+        vm.assume(uint160(account) > 0xff);
+        vm.assume(account != address(manager));
+        vm.assume(account != address(this));
+        vm.assume(account != address(vm));
+        vm.etch(account, hex"00");
+        vm.mockCall(account, abi.encodeWithSelector(MultiOwnable.isOwnerAddress.selector), abi.encode(true));
+    }
+
     /// @dev Registers a recovery for `account` (pranked as the registrant) against the deployed provider.
     function _addRecovery(address account, bytes memory commitment, uint32 delay) private returns (bytes32 recoveryId) {
+        _stubManagerOwner(account);
         vm.prank(account);
         return manager.addRecovery(account, address(provider), commitment, delay);
     }

@@ -31,6 +31,8 @@ contract TestManagerWriteFunctions is Test, PrepareRecovery {
     }
 
     /// @dev Registers a recovery for `account` against a freshly-etched `provider`, pranked as the account.
+    ///      Stubs the account as having the manager registered as an owner (the opt-in `addRecovery` now
+    ///      requires), since callers of this helper are testing something other than that check.
     function _addRecovery(
         address account,
         address provider,
@@ -41,6 +43,7 @@ contract TestManagerWriteFunctions is Test, PrepareRecovery {
         returns (bytes32 recoveryId)
     {
         _etchCode(provider);
+        _stubManagerOwner(account, true);
         vm.prank(account);
         return manager.addRecovery(account, provider, commitment, delay);
     }
@@ -50,10 +53,18 @@ contract TestManagerWriteFunctions is Test, PrepareRecovery {
         vm.mockCall(provider, abi.encodeWithSelector(IRecoveryProvider.verify.selector), "");
     }
 
-    /// @dev Etches `account` (so the `isOwnerBytes` call's extcodesize check passes) and stubs that call to
-    ///      return `isOwner`.
-    function _stubAccount(address account, bool isOwner) private {
+    /// @dev Etches `account` (so the `isOwnerAddress` call's extcodesize check passes) and stubs that call to
+    ///      return `isManagerOwner`, i.e. whether the recovery manager is registered as an owner of `account`.
+    function _stubManagerOwner(address account, bool isManagerOwner) private {
         _etchCode(account);
+        vm.mockCall(account, abi.encodeWithSelector(MultiOwnable.isOwnerAddress.selector), abi.encode(isManagerOwner));
+    }
+
+    /// @dev Etches `account` (so the `isOwnerBytes`/`isOwnerAddress` calls' extcodesize checks pass), stubs
+    ///      `isOwnerBytes` to return `isOwner`, and stubs the manager as registered as an owner (true) so the
+    ///      `requestRecovery` opt-in check passes by default.
+    function _stubAccount(address account, bool isOwner) private {
+        _stubManagerOwner(account, true);
         vm.mockCall(account, abi.encodeWithSelector(MultiOwnable.isOwnerBytes.selector), abi.encode(isOwner));
     }
 
@@ -147,6 +158,7 @@ contract TestManagerWriteFunctions is Test, PrepareRecovery {
     {
         vm.assume(commitment.length != 0);
         _etchCode(provider);
+        _stubManagerOwner(account, true);
 
         vm.prank(account);
         bytes32 recoveryId = manager.addRecovery(account, provider, commitment, delay);
@@ -171,6 +183,7 @@ contract TestManagerWriteFunctions is Test, PrepareRecovery {
     {
         vm.assume(commitment.length != 0);
         _etchCode(provider);
+        _stubManagerOwner(account, true);
 
         bytes32 expectedId = keccak256(abi.encode(account, provider, commitment));
 
@@ -203,6 +216,7 @@ contract TestManagerWriteFunctions is Test, PrepareRecovery {
         vm.assume(commitment1.length != 0 && commitment2.length != 0);
         vm.assume(keccak256(commitment1) != keccak256(commitment2));
         _etchCode(provider);
+        _stubManagerOwner(account, true);
 
         vm.prank(account);
         bytes32 recoveryId1 = manager.addRecovery(account, provider, commitment1, delay1);
@@ -214,6 +228,26 @@ contract TestManagerWriteFunctions is Test, PrepareRecovery {
         assertEq(manager.recoveryCount(account), 2);
         assertTrue(manager.hasRecovery(account, recoveryId1));
         assertTrue(manager.hasRecovery(account, recoveryId2));
+    }
+
+    function test_AddRecovery_RevertIfManagerNotAccountOwner(
+        address account,
+        address provider,
+        bytes calldata commitment,
+        uint32 delay
+    )
+        public
+    {
+        vm.assume(commitment.length != 0);
+        _etchCode(provider);
+        _stubManagerOwner(account, false);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(IRecoveryManager.JustaRecoveryManager_ManagerNotAccountOwner.selector, account)
+        );
+
+        vm.prank(account);
+        manager.addRecovery(account, provider, commitment, delay);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -317,6 +351,33 @@ contract TestManagerWriteFunctions is Test, PrepareRecovery {
         assertEq(manager.recoveryCount(account), 0);
     }
 
+    function test_RemoveRecovery_ShouldSucceedIfManagerNotAccountOwner(
+        address account,
+        address provider,
+        bytes calldata commitment1,
+        bytes calldata commitment2
+    )
+        public
+    {
+        vm.assume(commitment1.length != 0 && commitment2.length != 0);
+        vm.assume(keccak256(commitment1) != keccak256(commitment2));
+
+        bytes32 recoveryId1 = _addRecovery(account, provider, commitment1, 0);
+        bytes32 recoveryId2 = _addRecovery(account, provider, commitment2, 0);
+
+        // The manager was removed as an owner after setup (e.g. the account opted out): teardown must still
+        // work, or the account would be stuck with recoveries it can never remove.
+        _stubManagerOwner(account, false);
+
+        vm.prank(account);
+        manager.removeRecovery(account, recoveryId1);
+        assertEq(manager.recoveryCount(account), 1);
+
+        vm.prank(account);
+        manager.removeRecovery(account, recoveryId2);
+        assertEq(manager.recoveryCount(account), 0);
+    }
+
     /*//////////////////////////////////////////////////////////////
                        setRecoveryThreshold() TESTS
     //////////////////////////////////////////////////////////////*/
@@ -397,6 +458,34 @@ contract TestManagerWriteFunctions is Test, PrepareRecovery {
         assertEq(manager.recoveryThreshold(account), threshold);
     }
 
+    function test_SetRecoveryThreshold_ShouldSucceedIfManagerNotAccountOwner(
+        address account,
+        address provider,
+        bytes calldata commitment1,
+        bytes calldata commitment2
+    )
+        public
+    {
+        vm.assume(commitment1.length != 0 && commitment2.length != 0);
+        vm.assume(keccak256(commitment1) != keccak256(commitment2));
+
+        _addRecovery(account, provider, commitment1, 0);
+        _addRecovery(account, provider, commitment2, 0);
+
+        vm.prank(account);
+        manager.setRecoveryThreshold(account, 2);
+
+        // The manager was removed as an owner after setup (e.g. the account opted out): lowering the
+        // threshold must stay possible, or `removeRecovery`'s below-threshold guard would make stale
+        // recoveries permanently impossible to clean up.
+        _stubManagerOwner(account, false);
+
+        vm.prank(account);
+        manager.setRecoveryThreshold(account, 1);
+
+        assertEq(manager.recoveryThreshold(account), 1);
+    }
+
     /*//////////////////////////////////////////////////////////////
                           requestRecovery() TESTS
     //////////////////////////////////////////////////////////////*/
@@ -451,6 +540,36 @@ contract TestManagerWriteFunctions is Test, PrepareRecovery {
             abi.encodeWithSelector(IRecoveryManager.JustaRecoveryManager_SubjectAlreadyOwner.selector, subject)
         );
         manager.requestRecovery(account, subject, approvals);
+    }
+
+    function test_RequestRecovery_RevertIfManagerNotAccountOwner(
+        address account,
+        address provider,
+        address newOwner,
+        bytes calldata commitment
+    )
+        public
+    {
+        vm.assume(commitment.length != 0);
+
+        // Otherwise-fully-valid setup: a registered recovery, the correct approval count, and an accepting
+        // provider — the manager opt-in check is the only reason this reverts.
+        bytes32 recoveryId = _addRecovery(account, provider, commitment, 0);
+        _stubAccount(account, false);
+        _stubManagerOwner(account, false);
+        _acceptVerify(provider);
+
+        bytes memory subject = encodeEoaSubject(newOwner);
+        IRecoveryManager.Approval[] memory approvals = new IRecoveryManager.Approval[](1);
+        approvals[0] = createApproval(recoveryId, "");
+
+        vm.expectRevert(
+            abi.encodeWithSelector(IRecoveryManager.JustaRecoveryManager_ManagerNotAccountOwner.selector, account)
+        );
+        manager.requestRecovery(account, subject, approvals);
+
+        // The proof was not consumed: the nonce never bumped.
+        assertEq(manager.recoveryNonce(account), 0);
     }
 
     function test_RequestRecovery_RevertIfRecoveryNotRegistered(
