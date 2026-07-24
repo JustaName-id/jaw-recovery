@@ -4,7 +4,7 @@ pragma solidity 0.8.30;
 import { Script } from "forge-std/Script.sol";
 
 import { IRecoveryManager } from "../src/interfaces/IRecoveryManager.sol";
-import { ECDSARecoveryProvider } from "../src/providers/ECDSARecoveryProvider.sol";
+import { SignatureRecoveryProvider } from "../src/providers/SignatureRecoveryProvider.sol";
 import { CodeConstants } from "./HelperConfig.s.sol";
 
 /**
@@ -50,10 +50,17 @@ contract PrepareRecovery is Script, CodeConstants {
     }
 
     /**
-     * @notice Encodes an EOA as a canonical 32-byte ECDSA recovery commitment (`abi.encode(eoa)`).
+     * @notice Encodes an EOA as a canonical 32-byte guardian commitment (`abi.encode(eoa)`).
      */
     function encodeEoaCommitment(address eoa) public pure returns (bytes memory) {
         return abi.encode(eoa);
+    }
+
+    /**
+     * @notice Encodes a passkey public key as a canonical 64-byte guardian commitment (`abi.encode(x, y)`).
+     */
+    function encodePasskeyCommitment(bytes32 x, bytes32 y) public pure returns (bytes memory) {
+        return abi.encode(x, y);
     }
 
     /**
@@ -71,54 +78,129 @@ contract PrepareRecovery is Script, CodeConstants {
     }
 
     /**
-     * @notice Produces a 65-byte ECDSA recovery proof signed by `privateKey` over the provider's canonical
-     *         EIP-712 digest for `(account, nonce, subject)`.
-     * @param provider The ECDSA recovery provider whose domain the proof is bound to.
+     * @notice Produces a 65-byte ECDSA recovery proof signed by `privateKey` over the provider's
+     *         chain-agnostic EIP-712 digest for `(account, subject, salt, expiry)`.
+     * @param provider The signature recovery provider whose domain the proof is bound to.
      * @param account The smart account being recovered.
-     * @param nonce The manager's current per-account recovery nonce.
      * @param subject The new-owner payload.
-     * @param privateKey The signing key (the committed recovery EOA's key for a valid proof).
+     * @param salt The ceremony's single-use salt.
+     * @param expiry The ceremony's expiry timestamp.
+     * @param privateKey The signing key (the committed guardian EOA's key for a valid proof).
      * @return proof The 65-byte `(r, s, v)` signature.
      */
     function signRecoverProof(
-        ECDSARecoveryProvider provider,
+        SignatureRecoveryProvider provider,
         address account,
-        uint256 nonce,
         bytes memory subject,
+        bytes32 salt,
+        uint256 expiry,
         uint256 privateKey
     )
         public
         view
         returns (bytes memory proof)
     {
-        bytes32 digest = provider.recoverDigest(account, nonce, subject);
+        bytes32 digest = provider.recoverDigest(account, subject, salt, expiry);
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(privateKey, digest);
         return abi.encodePacked(r, s, v);
     }
 
     /**
      * @notice Produces a 64-byte EIP-2098 compact ECDSA recovery proof signed by `privateKey` over the
-     *         provider's canonical EIP-712 digest for `(account, nonce, subject)`.
-     * @dev Mirrors `signRecoverProof` but returns the EIP-2098 short form `(r, vs)` that `SignatureCheckerLib`
-     *      also accepts for EOA signers. `vm.sign` yields canonical low-s, so the top bit of `s` is free to
-     *      carry the y-parity (`v - 27`).
+     *         provider's chain-agnostic EIP-712 digest for `(account, subject, salt, expiry)`.
+     * @dev Mirrors `signRecoverProof` but returns the EIP-2098 short form `(r, vs)` that Solady's ECDSA
+     *      also accepts for EOA signers. `vm.sign` yields canonical low-s, so the top bit of `s` is free
+     *      to carry the y-parity (`v - 27`).
      * @return proof The 64-byte `(r, vs)` compact signature.
      */
     function signRecoverProofCompact(
-        ECDSARecoveryProvider provider,
+        SignatureRecoveryProvider provider,
         address account,
-        uint256 nonce,
         bytes memory subject,
+        bytes32 salt,
+        uint256 expiry,
         uint256 privateKey
     )
         public
         view
         returns (bytes memory proof)
     {
-        bytes32 digest = provider.recoverDigest(account, nonce, subject);
+        bytes32 digest = provider.recoverDigest(account, subject, salt, expiry);
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(privateKey, digest);
         bytes32 vs = bytes32(uint256(s) | (uint256(v - 27) << 255));
         return abi.encodePacked(r, vs);
+    }
+
+    /**
+     * @notice Builds an ADD_RECOVERY admin op (`abi.encode(provider, commitment, delay)`).
+     */
+    function encodeAddRecoveryOp(
+        address provider,
+        bytes memory commitment,
+        uint32 delay
+    )
+        public
+        pure
+        returns (IRecoveryManager.AdminOp memory)
+    {
+        return IRecoveryManager.AdminOp({
+            opType: uint8(IRecoveryManager.AdminOpType.ADD_RECOVERY), data: abi.encode(provider, commitment, delay)
+        });
+    }
+
+    /**
+     * @notice Builds a REMOVE_RECOVERY admin op (`abi.encode(recoveryId)`).
+     */
+    function encodeRemoveRecoveryOp(bytes32 recoveryId) public pure returns (IRecoveryManager.AdminOp memory) {
+        return IRecoveryManager.AdminOp({
+            opType: uint8(IRecoveryManager.AdminOpType.REMOVE_RECOVERY), data: abi.encode(recoveryId)
+        });
+    }
+
+    /**
+     * @notice Builds a SET_THRESHOLD admin op (`abi.encode(threshold)`).
+     */
+    function encodeSetThresholdOp(uint256 threshold) public pure returns (IRecoveryManager.AdminOp memory) {
+        return IRecoveryManager.AdminOp({
+            opType: uint8(IRecoveryManager.AdminOpType.SET_THRESHOLD), data: abi.encode(threshold)
+        });
+    }
+
+    /**
+     * @notice Builds a CANCEL_REQUEST admin op (`abi.encode(requestId)`).
+     */
+    function encodeCancelRequestOp(bytes32 requestId) public pure returns (IRecoveryManager.AdminOp memory) {
+        return IRecoveryManager.AdminOp({
+            opType: uint8(IRecoveryManager.AdminOpType.CANCEL_REQUEST), data: abi.encode(requestId)
+        });
+    }
+
+    /**
+     * @notice Produces a 65-byte ECDSA admin proof signed by `privateKey` over the manager's
+     *         chain-agnostic EIP-712 digest for `(account, ops, salt, expiry)`.
+     * @param manager The recovery manager whose domain the proof is bound to.
+     * @param account The smart account whose recovery configuration is administered.
+     * @param ops The ordered admin operations.
+     * @param salt The batch's single-use salt.
+     * @param expiry The signature's expiry timestamp.
+     * @param privateKey The signing key (an EOA owner's key of the account for a valid proof).
+     * @return proof The 65-byte `(r, s, v)` signature.
+     */
+    function signAdminProof(
+        IRecoveryManager manager,
+        address account,
+        IRecoveryManager.AdminOp[] memory ops,
+        bytes32 salt,
+        uint256 expiry,
+        uint256 privateKey
+    )
+        public
+        view
+        returns (bytes memory proof)
+    {
+        bytes32 digest = manager.recoveryAdminDigest(account, ops, salt, expiry);
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(privateKey, digest);
+        return abi.encodePacked(r, s, v);
     }
 
 }
