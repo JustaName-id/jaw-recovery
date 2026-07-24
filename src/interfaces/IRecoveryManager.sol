@@ -9,8 +9,8 @@ pragma solidity 0.8.30;
  *
  * The unit of recovery is a "recovery": a `(provider, commitment)` pair plus a per-recovery time-lock
  * `delay`. The same provider may back several recoveries for one account (e.g. two ECDSA EOAs, or two
- * committed emails), each with its own delay. The manager owns the recoveries, the per-account replay
- * nonce, and the approval threshold; providers are stateless verifiers (see {IRecoveryProvider}).
+ * committed emails), each with its own delay. The manager owns the recoveries, the per-account used-salt
+ * registry, and the approval threshold; providers are stateless verifiers (see {IRecoveryProvider}).
  *
  * Recovery is a two-step time-locked flow built around a "recovery request":
  *   1. `requestRecovery` verifies one proof per recovery for the account's threshold of distinct
@@ -103,6 +103,13 @@ interface IRecoveryManager {
     error JustaRecoveryManager_InvalidApprovalCount(uint256 submitted, uint256 required);
 
     /**
+     * @notice Thrown when the ceremony's `expiry` has passed at request time. Expiry bounds how long
+     *         unused guardian proofs stay usable; it has no effect on a request once queued.
+     * @param expiry The expired ceremony deadline.
+     */
+    error JustaRecoveryManager_ProofsExpired(uint256 expiry);
+
+    /**
      * @notice Thrown when `subject` is not 32 bytes (EOA owner) or 64 bytes (passkey owner).
      * @param length The length of the supplied subject.
      */
@@ -115,6 +122,15 @@ interface IRecoveryManager {
      * @param subject The offending subject.
      */
     error JustaRecoveryManager_InvalidSubject(bytes subject);
+
+    /**
+     * @notice Thrown when the ceremony's `salt` was already consumed for `account` on this chain.
+     *         Consumption makes a ceremony's proofs single-use per chain; other chains consume the same
+     *         salt independently.
+     * @param account The smart account.
+     * @param salt The already-consumed salt.
+     */
+    error JustaRecoveryManager_SaltAlreadyUsed(address account, bytes32 salt);
 
     /**
      * @notice Thrown when `subject` is already an owner of the account at request time. A best-effort
@@ -137,9 +153,72 @@ interface IRecoveryManager {
      */
     error JustaRecoveryManager_RequestNotReady(bytes32 requestId, uint64 executeAt);
 
+    /**
+     * @notice Thrown when `executeRecoveryRequest` targets an account with no code. Without this guard
+     *         the owner-add calls (which return nothing, so Solidity emits no code-existence check)
+     *         would succeed vacuously against a codeless address — deleting the request and emitting
+     *         success while registering no owner. Unreachable for CREATE2 accounts (code never
+     *         disappears); reachable for an EIP-7702 account whose key holder revoked the delegation
+     *         during the time-lock.
+     * @param account The codeless account.
+     */
+    error JustaRecoveryManager_AccountHasNoCode(address account);
+
+    /**
+     * @notice Thrown when `executeRecoveryAdmin` is called with an empty ops array.
+     */
+    error JustaRecoveryManager_EmptyAdminOps();
+
+    /**
+     * @notice Thrown when an admin op's `opType` is not a member of {AdminOpType}. Reverts the whole
+     *         batch (atomic application).
+     * @param opType The unknown op type.
+     */
+    error JustaRecoveryManager_InvalidAdminOp(uint8 opType);
+
+    /**
+     * @notice Thrown when the admin signer identified by `ownerBytes` is not a current owner of the
+     *         account. Checked at submission time on each chain, so signatures from a since-removed
+     *         owner die automatically.
+     * @param account The smart account.
+     * @param ownerBytes The rejected signer, in canonical MultiOwnable owner-bytes form.
+     */
+    error JustaRecoveryManager_SignerNotAccountOwner(address account, bytes ownerBytes);
+
+    /**
+     * @notice Thrown when the admin proof does not verify against `ownerBytes` over the batch digest.
+     */
+    error JustaRecoveryManager_InvalidOwnerProof();
+
     ////////////////////////////////////////////////////////////////////////
     // TYPES
     ////////////////////////////////////////////////////////////////////////
+
+    /**
+     * @notice The admin operations executable through `executeRecoveryAdmin`.
+     */
+    enum AdminOpType {
+        ADD_RECOVERY,
+        REMOVE_RECOVERY,
+        SET_THRESHOLD,
+        CANCEL_REQUEST
+    }
+
+    /**
+     * @notice One admin operation inside a signed `RecoveryAdmin` batch.
+     * @dev `opType` is deliberately a `uint8` rather than the enum so the struct matches the signed
+     *      EIP-712 type exactly (EIP-712 has no enum type) and an out-of-range value reaches the
+     *      manager's own `InvalidAdminOp` revert instead of an ABI-decoding panic. `data` encodings by
+     *      op type:
+     *        ADD_RECOVERY    → `abi.encode(address provider, bytes commitment, uint32 delay)`
+     *        REMOVE_RECOVERY → `abi.encode(bytes32 recoveryId)`
+     *        SET_THRESHOLD   → `abi.encode(uint256 threshold)`
+     *        CANCEL_REQUEST  → `abi.encode(bytes32 requestId)`
+     */
+    struct AdminOp {
+        uint8 opType;
+        bytes data;
+    }
 
     /**
      * @notice A registered recovery: a provider paired with a commitment it verifies against, plus the
@@ -192,6 +271,9 @@ interface IRecoveryManager {
     );
     event RecoveryRequestExecuted(address indexed account, bytes32 indexed requestId, bytes subject);
     event RecoveryRequestCancelled(address indexed account, bytes32 indexed requestId);
+    /// @dev Envelope event for a signed admin batch (per-op events still fire individually). `salt`
+    ///      identifies the batch across chains for indexers, mirroring `requestId` for ceremonies.
+    event RecoveryAdminExecuted(address indexed account, bytes32 salt, uint256 opsCount);
 
     ////////////////////////////////////////////////////////////////////////
     // RECOVERY ADMIN
@@ -235,6 +317,37 @@ interface IRecoveryManager {
      */
     function setRecoveryThreshold(address account, uint256 threshold) external;
 
+    /**
+     * @notice Execute a batch of admin operations authorized by a chain-agnostic signature from a
+     *         current owner of `account` — the multichain door. The `onlyAccount` functions above remain
+     *         the single-chain door; both apply the identical internal logic.
+     * @dev Unrestricted caller; the owner signature carries authorization, so a relayer can fan the same
+     *      bytes out to every chain. The signed digest omits `chainId` (manager deploys at the same
+     *      deterministic address on every chain) and binds `(account, ops, salt, expiry)`; see
+     *      `recoveryAdminDigest`. `salt` shares the ceremony registry: single-use per chain, reusable
+     *      across chains until `expiry`. The signer must be a CURRENT owner of `account` in canonical
+     *      owner-bytes form — 32-byte `abi.encode(address)` (EOA, strict ecrecover) or 64-byte
+     *      `abi.encode(x, y)` (raw passkey, direct WebAuthn). A smart-account owner cannot sign
+     *      chain-agnostically (its ERC-1271 door binds chainId) and must use the account door instead.
+     *      Ops are applied in order, atomically: any failing op (including an unknown `opType`) reverts
+     *      the whole batch on this chain.
+     * @param account The smart account whose recovery configuration is administered.
+     * @param ops The ordered admin operations (see {AdminOp} for per-type `data` encodings).
+     * @param salt The batch's single-use salt (random 32 bytes chosen off-chain).
+     * @param expiry The signature's expiry timestamp; bounds how long the unsubmitted batch stays usable.
+     * @param ownerBytes The authorizing owner in canonical MultiOwnable owner-bytes form.
+     * @param proof A 64/65-byte ECDSA signature or an ABI-encoded WebAuthn assertion over the digest.
+     */
+    function executeRecoveryAdmin(
+        address account,
+        AdminOp[] calldata ops,
+        bytes32 salt,
+        uint256 expiry,
+        bytes calldata ownerBytes,
+        bytes calldata proof
+    )
+        external;
+
     ////////////////////////////////////////////////////////////////////////
     // EXECUTION
     ////////////////////////////////////////////////////////////////////////
@@ -244,17 +357,24 @@ interface IRecoveryManager {
      *         new owner.
      * @dev Unrestricted caller; the proofs carry authorization. Requires exactly
      *      `recoveryThreshold(account)` distinct, registered recoveries, each verifying a proof over the
-     *      same `subject` and the account's current `recoveryNonce`. `subject` must be a 32-byte EOA owner
-     *      or a 64-byte passkey owner. The queued `executeAt` uses the largest delay among the approving
-     *      recoveries. The nonce is bumped on success, making the proofs single-use.
+     *      same `(subject, salt, expiry)` ceremony. `subject` must be a 32-byte EOA owner or a 64-byte
+     *      passkey owner. `salt` must be unused for the account on this chain and is consumed on success,
+     *      making the proofs single-use per chain; the same ceremony stays submittable on other chains.
+     *      Reverts once `expiry` has passed. The queued `executeAt` uses the largest delay among the
+     *      approving recoveries.
      * @param account The smart account to recover.
      * @param subject ABI-encoded new owner: `abi.encode(address)` (32B) or `abi.encode(bytes32 x, bytes32 y)` (64B).
+     * @param salt The ceremony's single-use salt (random 32 bytes chosen off-chain).
+     * @param expiry The ceremony's expiry timestamp; requests revert after it.
      * @param approvals One approval per required recovery: the recovery's id plus its proof.
-     * @return requestId A deterministic id for the queued recovery request.
+     * @return requestId A deterministic id for the queued recovery request
+     *         (`keccak256(abi.encode(account, subject, salt))` — identical on every chain).
      */
     function requestRecovery(
         address account,
         bytes calldata subject,
+        bytes32 salt,
+        uint256 expiry,
         Approval[] calldata approvals
     )
         external
@@ -324,10 +444,32 @@ interface IRecoveryManager {
     function recoveryThreshold(address account) external view returns (uint256);
 
     /**
-     * @notice The account's current recovery (replay) nonce. Bind this into proofs submitted to
-     *         `requestRecovery`; it increments on each successful request.
+     * @notice Whether `salt` has been consumed for `account` on this chain. A salt is consumed by a
+     *         successful `requestRecovery` and can never queue again here; the same ceremony stays
+     *         submittable on chains that have not consumed it.
      */
-    function recoveryNonce(address account) external view returns (uint256);
+    function isSaltUsed(address account, bytes32 salt) external view returns (bool);
+
+    /**
+     * @notice Compute the chain-agnostic EIP-712 digest an owner must sign to authorize an admin batch.
+     * @dev EOA owners sign this digest directly; passkey owners produce a WebAuthn assertion with
+     *      `challenge = abi.encode(digest)`. Identical on every chain (the domain omits chainId and the
+     *      manager deploys at the same deterministic address everywhere).
+     * @param account The smart account whose recovery configuration is administered.
+     * @param ops The ordered admin operations.
+     * @param salt The batch's single-use salt.
+     * @param expiry The signature's expiry timestamp.
+     * @return The EIP-712 digest to sign.
+     */
+    function recoveryAdminDigest(
+        address account,
+        AdminOp[] calldata ops,
+        bytes32 salt,
+        uint256 expiry
+    )
+        external
+        view
+        returns (bytes32);
 
     /**
      * @notice The details of a pending recovery request (a zeroed `RecoveryRequest` if not pending).
